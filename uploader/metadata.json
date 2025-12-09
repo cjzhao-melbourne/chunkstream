@@ -1,0 +1,4 @@
+{
+  "name": "Smart Chunkstream Uploader",
+  "description": "A high-performance, memory-efficient in-browser video segmenter and uploader using React, MP4Box.js and DASH."
+}

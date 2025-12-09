@@ -1,4 +1,3 @@
-# chunkstream
 # Chunkstream
 
 > **Stream big videos instantly, before they finish uploading.**  

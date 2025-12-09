@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Smart Chunkstream Uploader</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- MP4Box.js for parsing MP4 atoms (served locally with CDN fallback) -->
+    <script src="/lib/mp4box.all.min.js" crossorigin="anonymous"></script>
+    <script>
+      if (!window.MP4Box) {
+        const fallback = document.createElement("script");
+        fallback.src = "https://cdn.jsdelivr.net/npm/mp4box@0.5.2/dist/mp4box.all.min.js";
+        fallback.crossOrigin = "anonymous";
+        fallback.onload = () => console.info("MP4Box fallback loaded from jsDelivr");
+        fallback.onerror = () =>
+          console.error("Failed to load MP4Box from local and jsDelivr; segmentation will not work.");
+        document.head.appendChild(fallback);
+      }
+    </script>
+    <!-- Dash.js for playback -->
+    <script src="https://cdn.dashjs.org/latest/dash.all.min.js"></script>
+  <script type="importmap">
+{
+  "imports": {
+    "react": "https://aistudiocdn.com/react@^19.2.0",
+    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
+    "react/": "https://aistudiocdn.com/react@^19.2.0/"
+  }
+}
+</script>
+</head>
+  <body class="bg-slate-900 text-slate-200 antialiased">
+    <div id="root"></div>
+  <script type="module" src="/index.tsx"></script>
+</body>
+</html>
