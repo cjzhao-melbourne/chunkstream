@@ -75,6 +75,12 @@ export interface MP4BoxSample {
   offset: number; // Important: Byte offset
 }
 
+// mp4box.js custom buffer that extends ArrayBuffer with metadata
+export interface MP4BoxBuffer extends ArrayBuffer {
+  fileStart: number;
+  usedBytes?: number;
+}
+
 export interface MP4File {
   onReady: (info: MP4BoxInfo) => void;
   onError: (e: any) => void;
