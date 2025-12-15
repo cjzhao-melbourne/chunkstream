@@ -93,4 +93,5 @@ export interface MP4File {
   setSegmentOptions: (id: number, user: any, options: any) => void;
   releaseUsedSamples: (id: number, sampleNum: number) => void;
   initializeSegmentation: () => Record<number, { id: number; user: any; buffer: ArrayBuffer }>;
+  setExternalSegmentBoundaries?: (id: number, user: any, boundarySamples: number[], opts?: { rapAlignement?: boolean }) => void;
 }

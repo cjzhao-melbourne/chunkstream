@@ -16,6 +16,7 @@ export class ChunkstreamEngine {
   private fragmentWaiters: Map<number, ((blob: Blob) => void)[]> = new Map();
   private fragmentGenerationDone = false;
   private segments: SegmentInfo[] = [];
+  private segmentSampleBoundaries: number[] = [];
   private inFlight = new Set<number>();
   private stopRequested = false;
   private totalDurationSec = 0;
@@ -49,6 +50,7 @@ export class ChunkstreamEngine {
       this.onProgress([...this.segments]);
       this.log(`MOOV parsed. Virtual segments ready: ${segments.length}. Duration ${(this.totalDurationSec).toFixed(2)}s`);
 
+      
       // 2) Start streaming fragmenter (produces moof/mdat progressively)
       this.startStreamingFragmenter(this.segments);
 
@@ -62,14 +64,17 @@ export class ChunkstreamEngine {
       this.videoId = video_id;
       this.log(`Session initialized. Video ID: ${this.videoId}`);
 
-      // Generate init from cached header (ftyp+moov) to avoid re-reading tail
-      const videoTrack = info.videoTracks[0];
-      if (!videoTrack) throw new Error("No video track found");
-      this.initFragment = await this.generateInitFromHeader(this.headerBuffer!, videoTrack.id);
+     
+     if (!this.headerBuffer) {
+       throw new Error("Header buffer missing before uploading init segment");
+     }
 
-      // 4) Upload init
-      await this.uploadInitSegment();
-
+     const formData = new FormData();
+     const initBlob = new Blob([this.headerBuffer], { type: "video/iso.segment" });
+     formData.append("init", initBlob, "init.m4s");
+     await backendService.uploadInit(this.videoId, formData);
+     this.log(`Init segment uploaded .`);
+      
       // 5) Register uploader and start scheduling loop (uploads in background)
       const { uploader_id } = await backendService.registerUploader(this.videoId, this.maxConcurrency);
       this.uploaderId = uploader_id;
@@ -135,12 +140,15 @@ export class ChunkstreamEngine {
         lastSample: samples[samples.length - 1]
       });
 
+          
+
       const trackTimescale = videoTrack.timescale || videoTrackInfo.timescale || info.timescale;
       const totalDuration = info.duration / info.timescale;
-      const segments = this.buildSegmentsFromSamples(samples, trackTimescale, totalDuration);
+      const { segments, boundaries } = this.buildSegmentsFromSamples(samples, trackTimescale, totalDuration);
       if (segments.length === 0) {
         throw new Error("No segments were constructed from the sample table.");
       }
+      this.segmentSampleBoundaries = boundaries;
 
       if (!header) {
         throw new Error("Failed to receive MP4 header buffer from loadMoovOnly");
@@ -150,7 +158,7 @@ export class ChunkstreamEngine {
     });
   }
 
-  private buildSegmentsFromSamples(samples: MP4BoxSample[], timescale: number, totalDuration: number): SegmentInfo[] {
+  private buildSegmentsFromSamples(samples: MP4BoxSample[], timescale: number, totalDuration: number): { segments: SegmentInfo[]; boundaries: number[] } {
     if (!samples || samples.length === 0) {
       throw new Error("No samples available to build segments.");
     }
@@ -162,6 +170,7 @@ export class ChunkstreamEngine {
     }
 
     const segments: SegmentInfo[] = [];
+    const boundaries: number[] = [];
     let currentSegStartSample = 0;
     let currentSegStartTime = samples[0].dts / timescale;
     let lastSyncIndex = samples[0].is_sync ? 0 : -1;
@@ -170,18 +179,18 @@ export class ChunkstreamEngine {
     for (let i = 1; i < samples.length; i++) {
       const s = samples[i];
       if (s.is_sync) lastSyncIndex = i;
-      const currentTime = s.dts / timescale;
-      const elapsed = currentTime - currentSegStartTime;
+      
+      const elapsed = s.dts / timescale - currentSegStartTime;
 
-      // Prefer to cut on sync; if none encountered for too long, cut on time anyway
-      const shouldCutOnSync = s.is_sync && elapsed >= this.segmentDuration;
-      const tooLongWithoutSync = elapsed >= this.segmentDuration * 1.5;
-      if (shouldCutOnSync || tooLongWithoutSync) {
-        const boundaryIndex = shouldCutOnSync && lastSyncIndex > currentSegStartSample
-          ? lastSyncIndex
-          : i;
+      if (s.is_sync && elapsed >= this.segmentDuration * 0.75) {
+        // boundaryIndex：starting point for next segment
+        const boundaryIndex = i;
+
+        // starting sample and end sample for current segment
         const startSample = samples[currentSegStartSample];
-        const endSample = samples[boundaryIndex - 1];
+        const endSample = samples[boundaryIndex - 1]; // note: it is the previous sample
+
+        // current segment
         segments.push({
           index: segments.length,
           startTime: currentSegStartTime,
@@ -191,14 +200,16 @@ export class ChunkstreamEngine {
           duration: (endSample.dts / timescale) - currentSegStartTime,
           status: 'pending'
         });
+        boundaries.push(endSample.number);
 
+        // update the starting sample for next segment
         currentSegStartSample = boundaryIndex;
-        currentSegStartTime = samples[boundaryIndex].dts / timescale;
-        // Reset lastSyncIndex if we jumped past it
-        lastSyncIndex = samples[boundaryIndex].is_sync ? boundaryIndex : -1;
+        currentSegStartTime = s.dts / timescale;        
       }
+
     }
 
+    //the very last segment
     const startSample = samples[currentSegStartSample];
     const endSample = samples[samples.length - 1];
     segments.push({
@@ -210,8 +221,9 @@ export class ChunkstreamEngine {
       duration: totalDuration - currentSegStartTime,
       status: 'pending'
     });
+    boundaries.push(endSample.number);
 
-    return segments;
+    return { segments, boundaries };
   }
 
   private generateDASHManifest(info: MP4BoxInfo, segments: SegmentInfo[]): string {
@@ -292,7 +304,11 @@ export class ChunkstreamEngine {
     const segment = this.segments.find(s => s.index === index);
     if (!segment) return;
     const fragment = await this.waitForFragment(index, 20000);
-    if (!fragment) return;
+    if (!fragment) {
+      this.log(`Segment ${index} not ready, will retry`);
+      this.updateSegmentStatus(index, 'pending');
+      return;
+    }
 
     this.log(`Processing segment ${index} (${segment.startTime.toFixed(2)}-${segment.endTime.toFixed(2)}s)`);
 
@@ -327,9 +343,7 @@ export class ChunkstreamEngine {
     if (!this.videoId) {
       throw new Error("videoId missing before uploading init segment");
     }
-    if (!this.initFragment) {
-      throw new Error("Init fragment missing; fragmentation did not run");
-    }
+    
     const formData = new FormData();
     formData.append("init", this.initFragment, "init.m4s");
     await backendService.uploadInit(this.videoId, formData);
@@ -388,24 +402,36 @@ export class ChunkstreamEngine {
         return;
       }
       videoTrackId = videoTrack.id;
-      const nbSamplesPerFragment = Math.max(1, Math.ceil((videoTrack.nb_samples || 0) / this.segments.length));
-      mp4boxFile.setSegmentOptions(videoTrackId, null, {
-        nbSamples: nbSamplesPerFragment,
-        nbSamplesPerFragment,
-        rapAlignement: true
-      });
+      if (typeof mp4boxFile.setExternalSegmentBoundaries === "function" && this.segmentSampleBoundaries.length > 0) {
+        mp4boxFile.setExternalSegmentBoundaries(videoTrackId, null, this.segmentSampleBoundaries, { rapAlignement: true });
+        this.log(`Segmenter using external boundaries count=${this.segmentSampleBoundaries.length}`);
+      } else {
+        const desiredFragments = Math.max(1, this.segments.length);
+        const totalSamples = videoTrack.nb_samples || desiredFragments;
+        let nbSamplesPerFragment = Math.max(1, Math.floor(totalSamples / desiredFragments));
+        let expectedFragments = Math.ceil(totalSamples / nbSamplesPerFragment);
+        if (expectedFragments < desiredFragments) {
+          nbSamplesPerFragment = Math.max(1, Math.ceil(totalSamples / desiredFragments));
+          expectedFragments = Math.ceil(totalSamples / nbSamplesPerFragment);
+        }
+        this.log(`Segmenter config: samples=${totalSamples}, targetFragments=${desiredFragments}, nbSamplesPerFragment=${nbSamplesPerFragment}, expectedFragments=${expectedFragments}`);
+        mp4boxFile.setSegmentOptions(videoTrackId, null, {
+          nbSamples: nbSamplesPerFragment,
+          nbSamplesPerFragment,
+          rapAlignement: true
+        });
+      }
       // Initialize segmentation so mp4box starts emitting moof/mdat in onSegment; init is built separately from cached header.
       mp4boxFile.initializeSegmentation();
       mp4boxFile.start();
     };
 
     mp4boxFile.onSegment = (_id: number, _user: any, buffer: ArrayBuffer, sampleNum: number, isLast: boolean) => {
-      if (segmentIndex >= segments.length) {
-        return;
-      }
+     
       const blob = new Blob([buffer], { type: "video/iso.segment" });
       this.segmentFragments.set(segmentIndex, blob);
       this.notifyFragmentReady(segmentIndex, blob);
+      this.log(`notify Fragment:${segmentIndex}`);
       segmentIndex += 1;
       if (videoTrackId !== null) {
         mp4boxFile.releaseUsedSamples(videoTrackId, sampleNum);
@@ -447,12 +473,5 @@ export class ChunkstreamEngine {
     });
   }
 
-  /**
-   * Generate init.m4s from cached ftyp+moov header without reading full file again.
-   */
-  private async generateInitFromHeader(headerBuffer: MP4BoxBuffer, _videoTrackId: number): Promise<Blob> {
-    // headerBuffer is already ftyp+moov contiguous from offset 0, so we can wrap directly.
-    (headerBuffer as any).fileStart = 0;
-    return Promise.resolve(new Blob([headerBuffer], { type: "video/iso.segment" }));
-  }
+  
 }

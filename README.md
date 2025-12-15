@@ -1,24 +1,24 @@
 # Chunkstream
 
-> **Stream big videos instantly, before they finish uploading.**  
+> **Sharing big videos instantly, before they finish uploading.**  
 > Frontend MPEG-DASH slicing + backend intelligent upload scheduling.
 
 ---
 
 ## 1. What is Chunkstream?
 
-**Chunkstream** is a prototype video sharing platform that lets users share **large MP4 files** as a **MPEG-DASH stream** within seconds — long before the entire video has been uploaded.
+**Chunkstream** is a prototype video sharing platform that lets users share **large MP4 files** as a **MPEG-DASH stream** within milisecond — long before the entire video has been uploaded.
 
 Instead of uploading a multi-GB file and waiting forever for a link, Chunkstream:
 
 1. **Analyzes the MP4 file directly in the browser**
-2. **Virtually slices** it into ~10-second chunks (aligned to keyframes in the future version)
+2. **Virtually slices** it into ~10-second chunks (aligned to keyframes)
 3. **Generates a MPEG-DASH manifest (MPD)** that references these segments
 4. **Streams the video as soon as the first few chunks are available**
 
 On the backend, Chunkstream orchestrates uploads with a **two-queue scheduler** (normal + priority) so that segments near the current playback position are always uploaded and processed first, keeping user-perceived latency low even when the full video is still in flight.
 
-The backend is written in **Python**, designed to be extended with **video analysis and intelligence** later (e.g., content tagging, scene detection, recommendations, etc.).
+The backend is written in **Python**, designed to be extended with **video transcoding , video analysis and intelligence** later (e.g., content tagging, scene detection, recommendations, etc.).
 
 ---
 
@@ -63,7 +63,7 @@ The backend is written in **Python**, designed to be extended with **video analy
 1. **User selects MP4 file in browser**
 2. Browser:
    - parses MP4 header
-   - decides chunk boundaries (~10s each, keyframe-aligned in future versions)
+   - decides chunk boundaries (~10s each, keyframe-aligned )
 3. Browser:
    - uploads chunk metadata + binary segments to backend
    - generates and uploads MPD manifest
@@ -86,7 +86,7 @@ The backend is written in **Python**, designed to be extended with **video analy
 
 - **Frontend**
   - Vanilla JavaScript
-  - [`mp4box.js`](https://github.com/gpac/mp4box.js) for MP4 parsing (future precise chunking)
+  - [`mp4box.js`](https://github.com/gpac/mp4box.js) for MP4 parsing (do not use the standard version, use the version we customized)
   - [`dash.js`](https://github.com/Dash-Industry-Forum/dash.js) for MPEG-DASH playback
   - Simple static HTML/CSS UI
 
@@ -108,7 +108,7 @@ chunkstream/
 │   ├── scheduler.py     # Two-queue upload scheduler
 │   ├── models.py        # Pydantic models for API and tasks
 │   └── storage/         # Local storage (MPD + segments)
-└── frontend/
+└── uploader/
     ├── index.html       # Upload + preview UI
-    └── app.js           # Browser logic: analyze, chunk, upload, play
+    └── app.tsx           # Browser logic: analyze, chunk, upload, play
 
