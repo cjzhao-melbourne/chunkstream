@@ -16,6 +16,16 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ manifestUrl, videoId }
     if (manifestUrl && videoRef.current && !playerRef.current) {
       const player = dashjs.MediaPlayer().create();
       player.initialize(videoRef.current, manifestUrl, true);
+
+      // Use dash.js playback event to get the actual seek target time
+      player.on(dashjs.MediaPlayer.events.PLAYBACK_SEEKING, (e: any) => {
+        if (!videoId) return;
+        const seekTime = (e && typeof e.seekTime === "number") ? e.seekTime : videoRef.current?.currentTime || 0;
+        const estimatedIndex = Math.floor(seekTime / 10); // segment duration assumed 10s
+        console.log(`Dash seek -> ${seekTime}s -> segment ${estimatedIndex}`);
+        backendService.prioritizeSegment(videoId, estimatedIndex);
+      });
+
       playerRef.current = player;
       console.log("Dash Player Initialized");
     }
@@ -26,16 +36,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ manifestUrl, videoId }
         playerRef.current = null;
       }
     };
-  }, [manifestUrl]);
-
-  const handleSeeking = () => {
-    if (!videoRef.current || !videoId) return;
-    const currentTime = videoRef.current.currentTime;
-    // Assuming 10s segments approx, tell backend to prioritize
-    const estimatedIndex = Math.floor(currentTime / 10);
-    console.log(`Seeking to ${currentTime}s -> Prioritizing Segment ${estimatedIndex}`);
-    backendService.prioritizeSegment(videoId, estimatedIndex);
-  };
+  }, [manifestUrl, videoId]);
 
   if (!manifestUrl) return null;
 
@@ -45,7 +46,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ manifestUrl, videoId }
         ref={videoRef} 
         className="w-full h-full" 
         controls
-        onSeeking={handleSeeking}
       />
       <div className="absolute top-2 right-2 bg-black/70 text-xs text-white px-2 py-1 rounded pointer-events-none">
         DASH Stream

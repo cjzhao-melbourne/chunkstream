@@ -84,9 +84,9 @@ export const backendService = {
     return resp.json();
   },
 
-  async uploadSegment(videoId: string, formData: FormData): Promise<void> {
+  async uploadSegment(videoId: string, index: number, formData: FormData): Promise<void> {
     const resp = await fetch(
-      `${BACKEND_BASE}/videos/${videoId}/segments`,
+      `${BACKEND_BASE}/videos/${videoId}/segments/${index}`,
       {
         method: "POST",
         body: formData
@@ -97,7 +97,7 @@ export const backendService = {
 
   async prioritizeSegment(videoId: string, index: number): Promise<void> {
     try {
-      await fetch(`${BACKEND_BASE}/videos/${videoId}/prioritize`, {
+      await fetch(`${BACKEND_BASE}/videos/${videoId}/prioritize/${index}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ index })

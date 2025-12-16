@@ -105,14 +105,7 @@ async def get_init_segment(video_id: str):
 # ---------------- API: 上传单个片段 ----------------
 
 
-@app.post("/videos/{video_id}/segments")
-async def upload_segment(
-    video_id: str,
-    segment: UploadFile = File(...),
-    index: int = Form(...),
-    start_time: float = Form(0.0),
-    end_time: float = Form(0.0),
-):
+async def _save_segment(video_id: str, index: int, segment: UploadFile):
     if video_id not in videos_meta:
         raise HTTPException(status_code=404, detail="video_id 不存在")
 
@@ -134,16 +127,56 @@ async def upload_segment(
 
     return {"status": "ok", "index": index}
 
+
+@app.post("/videos/{video_id}/segments")
+async def upload_segment_legacy(
+    video_id: str,
+    segment: UploadFile = File(...),
+    index: int = Form(...),
+    start_time: float = Form(0.0),
+    end_time: float = Form(0.0),
+):
+    """
+    兼容旧路径：POST /videos/{video_id}/segments，index 从表单读取。
+    """
+    return await _save_segment(video_id, index, segment)
+
+
+@app.post("/videos/{video_id}/segments/{index}")
+async def upload_segment_with_path(
+    video_id: str,
+    index: int,
+    segment: UploadFile = File(...),
+    start_time: float = Form(0.0),
+    end_time: float = Form(0.0),
+):
+    """
+    新路径：POST /videos/{video_id}/segments/{index}
+    这样从服务端日志就能直接看到当前处理的片段 index。
+    """
+    return await _save_segment(video_id, index, segment)
+
 # ---------------- API: 播放端上报“优先片段” ----------------
 
 
 @app.post("/videos/{video_id}/prioritize")
 async def prioritize_segment(video_id: str, req: PriorityRequest):
+    # 兼容旧路径（无 path index），从 body 读 index
     if video_id not in videos_meta:
         raise HTTPException(status_code=404, detail="video_id 不存在")
 
     await scheduler.bump_priority_around(video_id, req.index)
     return {"status": "ok", "index": req.index}
+
+
+@app.post("/videos/{video_id}/prioritize/{index}")
+async def prioritize_segment_with_path(video_id: str, index: int):
+    # 新路径，index 在 URL 里，日志更直观
+    if video_id not in videos_meta:
+        raise HTTPException(status_code=404, detail="video_id 不存在")
+
+    await scheduler.bump_priority_around(video_id, index)
+    return {"status": "ok", "index": index}
 
 # ---------------- API: 上传/获取 MPD manifest ----------------
 

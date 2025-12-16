@@ -313,7 +313,7 @@ export class ChunkstreamEngine {
     formData.append("start_time", segment.startTime.toString());
     formData.append("end_time", segment.endTime.toString());
 
-    await backendService.uploadSegment(this.videoId!, formData);
+    await backendService.uploadSegment(this.videoId!, index, formData);
     
     this.updateSegmentStatus(index, 'completed');
     this.log(`Segment ${index} uploaded.`);
