@@ -53,8 +53,13 @@ export class ChunkstreamEngine {
       this.log(`MOOV parsed. Virtual segments ready: ${segments.length}. Duration ${(this.totalDurationSec).toFixed(2)}s`);
 
       
+      const videoTrack = info.videoTracks[0];
+      if (!videoTrack) {
+        throw new Error("No video track found when building init segment");
+      }
+
       // 2) Start streaming fragmenter (produces moof/mdat progressively)
-      this.startStreamingFragmenter(this.segments);
+      this.initFragment =await this.startStreamingFragmenter(this.segments);
 
       // 3) Backend session
       const { video_id } = await backendService.initSession(
@@ -71,9 +76,9 @@ export class ChunkstreamEngine {
        throw new Error("Header buffer missing before uploading init segment");
      }
 
+     // Build a proper fragmented init segment (ftyp+moov with mvex) using mp4box
      const formData = new FormData();
-     const initBlob = new Blob([this.headerBuffer], { type: "video/iso.segment" });
-     formData.append("init", initBlob, "init.m4s");
+     formData.append("init", this.initFragment, "init.m4s");
      await backendService.uploadInit(this.videoId, formData);
      this.log(`Init segment uploaded .`);
       
@@ -130,10 +135,7 @@ export class ChunkstreamEngine {
       if (samples.length === 0) {
         throw new Error("Sample table (stsz/stco) missing; cannot virtual slice. Please remux the file (faststart).");
       }
-      this.log(`stsz/stco samples parsed: ${samples.length}`);
-      
-
-          
+      this.log(`stsz/stco samples parsed: ${samples.length}`);       
 
       const trackTimescale = videoTrack.timescale || videoTrackInfo.timescale || info.timescale;
       const totalDuration = info.duration / info.timescale;
@@ -356,86 +358,107 @@ export class ChunkstreamEngine {
 
   /**
    * Streaming fragmentation with mp4box.js: reads file in small chunks and emits segments progressively.
-   * Init is generated separately from cached header.
+   * 
    */
-  private startStreamingFragmenter(segments: SegmentInfo[]): void {
+  private startStreamingFragmenter(segments: SegmentInfo[]): Promise<Blob> {
     const MP4Box = (window as any).MP4Box;
     if (!MP4Box || typeof MP4Box.createFile !== "function") {
       throw new Error("mp4box.js not available");
     }
 
-    const mp4boxFile = MP4Box.createFile();
-    let videoTrackId: number | null = null;
-    let segmentIndex = 0;
+    return new Promise((resolve, reject) => {
 
-    const CHUNK_SIZE = 1024 * 1024; // 1MB per read
+      try {
 
-    const feedChunks = async () => {
-      let offset = 0;
-      while (offset < this.file.size) {
-        if (this.stopRequested) break;
-        const end = Math.min(offset + CHUNK_SIZE, this.file.size);
-        const buf = await this.file.slice(offset, end).arrayBuffer();
-        (buf as any).fileStart = offset;
-        mp4boxFile.appendBuffer(buf);
-        offset = end;
-      }
-      mp4boxFile.flush();
-      this.fragmentGenerationDone = true;
-    };
+         const mp4boxFile = MP4Box.createFile();
+         let videoTrackId: number | null = null;
+         let segmentIndex = 0;
 
-    mp4boxFile.onError = (e: any) => {
-      this.log(`mp4box error: ${typeof e === "string" ? e : e?.message || "unknown"}`);
-    };
+         const CHUNK_SIZE = 1024 * 1024; // 1MB per read
 
-    mp4boxFile.onReady = (info: MP4BoxInfo) => {
-      const videoTrack = info.videoTracks[0];
-      if (!videoTrack) {
-        this.log("No video track found during segmenter onReady");
-        return;
-      }
-      videoTrackId = videoTrack.id;
-      if (typeof mp4boxFile.setExternalSegmentBoundaries === "function" && this.segmentSampleBoundaries.length > 0) {
-        mp4boxFile.setExternalSegmentBoundaries(videoTrackId, null, this.segmentSampleBoundaries, { rapAlignement: true });
-        this.log(`Segmenter using external boundaries count=${this.segmentSampleBoundaries.length}`);
-      } else {
-        const desiredFragments = Math.max(1, this.segments.length);
-        const totalSamples = videoTrack.nb_samples || desiredFragments;
-        let nbSamplesPerFragment = Math.max(1, Math.floor(totalSamples / desiredFragments));
-        let expectedFragments = Math.ceil(totalSamples / nbSamplesPerFragment);
-        if (expectedFragments < desiredFragments) {
-          nbSamplesPerFragment = Math.max(1, Math.ceil(totalSamples / desiredFragments));
-          expectedFragments = Math.ceil(totalSamples / nbSamplesPerFragment);
-        }
-        this.log(`Segmenter config: samples=${totalSamples}, targetFragments=${desiredFragments}, nbSamplesPerFragment=${nbSamplesPerFragment}, expectedFragments=${expectedFragments}`);
-        mp4boxFile.setSegmentOptions(videoTrackId, null, {
-          nbSamples: nbSamplesPerFragment,
-          nbSamplesPerFragment,
-          rapAlignement: true
-        });
-      }
-      // Initialize segmentation so mp4box starts emitting moof/mdat in onSegment; init is built separately from cached header.
-      mp4boxFile.initializeSegmentation();
-      mp4boxFile.start();
-    };
+         const feedChunks = async () => {
+           let offset = 0;
+           while (offset < this.file.size) {
+           if (this.stopRequested) break;
+           const end = Math.min(offset + CHUNK_SIZE, this.file.size);
+           const buf = await this.file.slice(offset, end).arrayBuffer();
+           (buf as any).fileStart = offset;
+           mp4boxFile.appendBuffer(buf);
+           offset = end;
+           }
+           mp4boxFile.flush();
+           this.fragmentGenerationDone = true;
+         };
 
-    mp4boxFile.onSegment = (_id: number, _user: any, buffer: ArrayBuffer, sampleNum: number, isLast: boolean) => {
+         mp4boxFile.onError = (e: any) => {
+         this.log(`mp4box error: ${typeof e === "string" ? e : e?.message || "unknown"}`);
+         };
+
+         mp4boxFile.onReady = (info: MP4BoxInfo) => {
+           const videoTrack = info.videoTracks[0];
+           if (!videoTrack) {
+           this.log("No video track found during segmenter onReady");
+           return;
+          }
+          
+           videoTrackId = videoTrack.id;
+           if (typeof mp4boxFile.setExternalSegmentBoundaries === "function" && this.segmentSampleBoundaries.length > 0) {
+           mp4boxFile.setExternalSegmentBoundaries(videoTrackId, null, this.segmentSampleBoundaries, { rapAlignement: true });
+           this.log(`Segmenter using external boundaries count=${this.segmentSampleBoundaries.length}`);
+           } else {
+           const desiredFragments = Math.max(1, this.segments.length);
+           const totalSamples = videoTrack.nb_samples || desiredFragments;
+           let nbSamplesPerFragment = Math.max(1, Math.floor(totalSamples / desiredFragments));
+           let expectedFragments = Math.ceil(totalSamples / nbSamplesPerFragment);
+           if (expectedFragments < desiredFragments) {
+           nbSamplesPerFragment = Math.max(1, Math.ceil(totalSamples / desiredFragments));
+           expectedFragments = Math.ceil(totalSamples / nbSamplesPerFragment);
+           }
+           this.log(`Segmenter config: samples=${totalSamples}, targetFragments=${desiredFragments}, nbSamplesPerFragment=${nbSamplesPerFragment}, expectedFragments=${expectedFragments}`);
+           mp4boxFile.setSegmentOptions(videoTrackId, null, {
+           nbSamples: nbSamplesPerFragment,
+           nbSamplesPerFragment,
+           rapAlignement: true
+           });
+           }
+           // Initialize segmentation so mp4box starts emitting moof/mdat in onSegment; init is built separately from cached header.
+           const initSegs = mp4boxFile.initializeSegmentation();
+           const initInfo =
+             (initSegs as any)?.buffer
+               ? (initSegs as any)
+               : (initSegs as any)?.[videoTrackId] ?? (initSegs ? Object.values(initSegs as any)[0] : undefined);
+           if (!initInfo?.buffer) {
+            const availableKeys = initSegs ? Object.keys(initSegs).join(",") : "none";
+            this.log(`initializeSegmentation returned no buffer; trackId=${videoTrackId} available=${availableKeys}. Falling back to header-based init build.`);
+            
+            return;
+             
+           }
+           mp4boxFile.start();
+           resolve(new Blob([initInfo.buffer], { type: "video/iso.segment" }));
+           };
+
+           mp4boxFile.onSegment = (_id: number, _user: any, buffer: ArrayBuffer, sampleNum: number, isLast: boolean) => {
      
-      const blob = new Blob([buffer], { type: "video/iso.segment" });
-      this.segmentFragments.set(segmentIndex, blob);
-      this.notifyFragmentReady(segmentIndex, blob);
-      this.log(`notify Fragment:${segmentIndex}`);
-      segmentIndex += 1;
-      if (videoTrackId !== null) {
-        mp4boxFile.releaseUsedSamples(videoTrackId, sampleNum);
-      }
-      if (isLast || segmentIndex >= segments.length) {
-        this.fragmentGenerationDone = true;
-      }
-    };
+           const blob = new Blob([buffer], { type: "video/iso.segment" });
+           this.segmentFragments.set(segmentIndex, blob);
+           this.notifyFragmentReady(segmentIndex, blob);
+           this.log(`notify Fragment:${segmentIndex}`);
+           segmentIndex += 1;
+           if (videoTrackId !== null) {
+           mp4boxFile.releaseUsedSamples(videoTrackId, sampleNum);
+           }
+           if (isLast || segmentIndex >= segments.length) {
+           this.fragmentGenerationDone = true;
+           }
+           };
 
-    // Start chunked read asynchronously
-    feedChunks().catch(err => this.log(`feedChunks error: ${err?.message || err}`));
+           // Start chunked read asynchronously
+           feedChunks().catch(err => this.log(`feedChunks error: ${err?.message || err}`));
+           } catch (err: any) {
+            reject(err);
+           }
+     });
   }
 
   private notifyFragmentReady(index: number, blob: Blob) {
