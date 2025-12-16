@@ -42,7 +42,9 @@ export class ChunkstreamEngine {
       this.log("Starting MOOV parse and streaming fragmentation...");
 
       // 1) Fast MOOV parse and virtual segments (no full read)
+      const t0 = performance.now();
       const { info, segments, headerBuffer } = await this.parseMoovAndVirtualize();
+      this.log(`loadMoovOnly: ${(performance.now() - t0).toFixed(1)}ms`);
       this.mp4Info = info;
       this.totalDurationSec = info.duration / info.timescale;
       this.segments = segments;
@@ -129,16 +131,7 @@ export class ChunkstreamEngine {
         throw new Error("Sample table (stsz/stco) missing; cannot virtual slice. Please remux the file (faststart).");
       }
       this.log(`stsz/stco samples parsed: ${samples.length}`);
-      console.log("[Chunkstream] Sample debug", {
-        firstSamples: samples.slice(0, 5).map(s => ({
-          number: s.number,
-          offset: s.offset,
-          size: s.size,
-          dts: s.dts,
-          is_sync: s.is_sync
-        })),
-        lastSample: samples[samples.length - 1]
-      });
+      
 
           
 
