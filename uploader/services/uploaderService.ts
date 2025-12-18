@@ -25,7 +25,12 @@ export interface TasksResponse {
   tasks: { index: number }[];
 }
 
-export const backendService = {
+/**
+ * uploadInit(..) POSTs the initialization segment (init.m4s) to /videos/{videoId}/init. 
+ * It sends the ftyp/moov header for the video so the backend can serve it to the player 
+ * before any media segments are uploaded.
+ */
+export const uploaderService = {
   async uploadInit(videoId: string, formData: FormData): Promise<void> {
     const resp = await fetch(`${BACKEND_BASE}/videos/${videoId}/init`, {
       method: "POST",
@@ -33,6 +38,14 @@ export const backendService = {
     });
     throwIfNotOk(resp, "Failed to upload init segment");
   },
+
+  /*
+   initSession(..) is the first call before uploading.
+   It POSTs to /videos/init with the source file name, size, intended segment count, and segment duration.
+    The backend creates a storage directory, records the metadata, 
+    registers the video with the scheduler, and returns a new video_id 
+    you’ll use for all subsequent init/segment uploads and prioritize requests.
+  */ 
 
   async initSession(filename: string, size: number, segmentCount: number, segmentDuration: number): Promise<InitResponse> {
     const resp = await fetch(`${BACKEND_BASE}/videos/init`, {
@@ -58,6 +71,14 @@ export const backendService = {
     throwIfNotOk(resp, "Failed to upload manifest");
   },
 
+  /*
+     registerUploader calls the backend POST /videos/{videoId}/uploaders/register with max_concurrency; 
+     the backend assigns an uploader_id and records that this uploader can work on that video.
+     The returned uploader_id is then used in subsequent getNextTasks requests so the scheduler
+     can hand out segments to this uploader.
+     Note： uploader_id is not videoId, this id is disigned for parallel uploading(even accross machines)
+  */
+
   async registerUploader(videoId: string, maxConcurrency: number): Promise<RegisterResponse> {
     const resp = await fetch(`${BACKEND_BASE}/videos/${videoId}/uploaders/register`, {
       method: "POST",
@@ -68,6 +89,15 @@ export const backendService = {
     return resp.json();
   },
 
+  /**
+   * getNextTasks is the uploader-side polling call to ask the backend scheduler 
+   * “which segments should I upload next”. 
+   * It POSTs to /videos/{videoId}/uploaders/{uploaderId}/next-tasks with:
+   * need_slots: how many upload slots are free
+   * already_uploading: which segment indexes this uploader is currently working on
+   * The backend responds with a list of tasks (segment indexes, ordered by its priority logic).
+   * The uploader loop then picks those segments to generate/upload.
+   **/
   async getNextTasks(videoId: string, uploaderId: string, needSlots: number, inFlight: number[]): Promise<TasksResponse> {
     const resp = await fetch(
       `${BACKEND_BASE}/videos/${videoId}/uploaders/${uploaderId}/next-tasks`,
@@ -94,20 +124,4 @@ export const backendService = {
     );
     throwIfNotOk(resp, "Failed to upload segment");
   },
-
-  async prioritizeSegment(videoId: string, index: number): Promise<void> {
-    try {
-      await fetch(`${BACKEND_BASE}/videos/${videoId}/prioritize/${index}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ index })
-      });
-    } catch (e) {
-      console.warn("Prioritize failed", e);
-    }
-  },
-  
-  getManifestUrl(videoId: string): string {
-    return `${BACKEND_BASE}/videos/${videoId}/manifest.mpd`;
-  }
 };

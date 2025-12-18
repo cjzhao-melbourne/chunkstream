@@ -1,5 +1,6 @@
 import { MP4BoxInfo, MP4File, SegmentInfo, MP4BoxSample, MP4BoxBuffer } from "../types";
-import { backendService } from "./backendService";
+import { uploaderService } from "./uploaderService";
+import { playerService } from "./playerService";
 
 export class ChunkstreamEngine {
   private file: File;
@@ -14,6 +15,7 @@ export class ChunkstreamEngine {
   private initFragment: Blob | null = null;
   private segmentFragments: Map<number, Blob> = new Map();
   private fragmentWaiters: Map<number, ((blob: Blob) => void)[]> = new Map();
+  private onDemandGeneration: Map<number, Promise<Blob | null>> = new Map();
   private fragmentGenerationDone = false;
   private segments: SegmentInfo[] = [];
   private segmentSampleBoundaries: number[] = [];
@@ -62,7 +64,7 @@ export class ChunkstreamEngine {
       this.initFragment =await this.startStreamingFragmenter(this.segments);
 
       // 3) Backend session
-      const { video_id } = await backendService.initSession(
+      const { video_id } = await uploaderService.initSession(
         this.file.name,
         this.file.size,
         segments.length,
@@ -79,11 +81,11 @@ export class ChunkstreamEngine {
      // Build a proper fragmented init segment (ftyp+moov with mvex) using mp4box
      const formData = new FormData();
      formData.append("init", this.initFragment, "init.m4s");
-     await backendService.uploadInit(this.videoId, formData);
+     await uploaderService.uploadInit(this.videoId, formData);
      this.log(`Init segment uploaded .`);
       
       // 5) Register uploader and start scheduling loop (uploads in background)
-      const { uploader_id } = await backendService.registerUploader(this.videoId, this.maxConcurrency);
+      const { uploader_id } = await uploaderService.registerUploader(this.videoId, this.maxConcurrency);
       this.uploaderId = uploader_id;
       this.log(`Uploader registered. ID: ${this.uploaderId}`);
       this.scheduleLoop();
@@ -91,12 +93,12 @@ export class ChunkstreamEngine {
       // 6) Upload MPD immediately after init
       const mpd = this.generateDASHManifest(info, this.segments);
       this.log(`Generated MPD:\n${mpd}`);
-      await backendService.uploadManifest(this.videoId, mpd);
+      await uploaderService.uploadManifest(this.videoId, mpd);
       this.log("Manifest uploaded.");
 
       // 7) Notify player after first segment uploaded (or timeout)
       await this.waitForSegmentCompletion(0, 20000);
-      this.onReadyToPlay(backendService.getManifestUrl(this.videoId), this.videoId);
+      this.onReadyToPlay(playerService.getManifestUrl(this.videoId), this.videoId);
 
     } catch (err: any) {
       this.log(`Error: ${err.message}`);
@@ -229,14 +231,44 @@ export class ChunkstreamEngine {
     const width = videoTrack?.track_width || 640;
     const height = videoTrack?.track_height || 360;
     const bandwidth = videoTrack?.bitrate || 1000000; // Default 1Mbps if unknown
+    const timescale = videoTrack?.timescale || info.timescale || 1;
+
+    // Build SegmentTimeline entries (s, d, r syntax)
+    const timelineParts: string[] = [];
+    let prevD: number | null = null;
+    let run = 0;
+    const flush = () => {
+      if (prevD == null) return;
+      const r = run > 1 ? ` r="${run - 1}"` : "";
+      timelineParts.push(`<S d="${prevD}"${r}/>`); 
+    };
+    for (const seg of segments) {
+      const dTicks = Math.max(1, Math.round((seg.endTime - seg.startTime) * timescale));
+      if (prevD === null) {
+        prevD = dTicks;
+        run = 1;
+      } else if (dTicks === prevD) {
+        run += 1;
+      } else {
+        flush();
+        prevD = dTicks;
+        run = 1;
+      }
+    }
+    flush();
+    const timelineXml = timelineParts.join("\n        ");
     
-    // Simple static DASH MPD
+    // Static DASH MPD with accurate SegmentTimeline
     return `<?xml version="1.0" encoding="UTF-8"?>
 <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" minBufferTime="PT2S" mediaPresentationDuration="PT${duration}S" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
   <Period id="1" start="PT0S">
     <AdaptationSet mimeType="video/mp4" segmentAlignment="true" startWithSAP="1">
       <Representation id="1" BANDWIDTH="${bandwidth}" codecs="${codec}" width="${width}" height="${height}" frameRate="30">
-        <SegmentTemplate initialization="init.m4s" timescale="1" duration="${this.segmentDuration}" media="segment_$Number$.m4s" startNumber="0" />
+        <SegmentTemplate initialization="init.m4s" timescale="${timescale}" media="segment_$Number$.m4s" startNumber="0">
+          <SegmentTimeline>
+        ${timelineXml}
+          </SegmentTimeline>
+        </SegmentTemplate>
       </Representation>
     </AdaptationSet>
   </Period>
@@ -260,11 +292,11 @@ export class ChunkstreamEngine {
       }
 
       try {
-        const { tasks } = await backendService.getNextTasks(
-          this.videoId!, 
-          this.uploaderId!, 
-          slotsAvailable, 
-          Array.from(this.inFlight)
+    const { tasks } = await uploaderService.getNextTasks(
+      this.videoId!, 
+      this.uploaderId!, 
+      slotsAvailable, 
+      Array.from(this.inFlight)
         );
 
         if (!tasks || tasks.length === 0) {
@@ -313,7 +345,7 @@ export class ChunkstreamEngine {
     formData.append("start_time", segment.startTime.toString());
     formData.append("end_time", segment.endTime.toString());
 
-    await backendService.uploadSegment(this.videoId!, index, formData);
+    await uploaderService.uploadSegment(this.videoId!, index, formData);
     
     this.updateSegmentStatus(index, 'completed');
     this.log(`Segment ${index} uploaded.`);
@@ -341,7 +373,7 @@ export class ChunkstreamEngine {
     
     const formData = new FormData();
     formData.append("init", this.initFragment, "init.m4s");
-    await backendService.uploadInit(this.videoId, formData);
+    await uploaderService.uploadInit(this.videoId, formData);
     this.log(`Init segment uploaded (${this.initFragment.size} bytes).`);
   }
 
@@ -354,6 +386,126 @@ export class ChunkstreamEngine {
       await this.sleep(200);
     }
     this.log(`Timeout waiting for segment ${index} to complete; proceeding anyway.`);
+  }
+
+  /**
+   * Build a specific fragment on-demand by reading only the byte range for that segment.
+   * Useful when a high-index segment is requested before sequential generation reaches it.
+   */
+  private async buildFragmentOnDemand(index: number): Promise<Blob | null> {
+    if (!this.headerBuffer || !this.mp4Info) {
+      this.log("On-demand build skipped: missing header/mp4 info");
+      return null;
+    }
+    const seg = this.segments.find(s => s.index === index);
+    if (!seg) {
+      this.log(`On-demand build skipped: segment ${index} not found`);
+      return null;
+    }
+
+    const MP4Box = (window as any).MP4Box;
+    if (!MP4Box || typeof MP4Box.createFile !== "function") {
+      this.log("mp4box.js not available for on-demand build");
+      return null;
+    }
+
+    return new Promise<Blob | null>((resolve) => {
+      try {
+        const mp4boxFile = MP4Box.createFile();
+        let videoTrackId: number | null = null;
+        let resolved = false;
+
+        mp4boxFile.onError = (e: any) => {
+          this.log(`on-demand mp4box error: ${typeof e === "string" ? e : e?.message || "unknown"}`);
+          if (!resolved) resolve(null);
+        };
+
+        mp4boxFile.onReady = (info: MP4BoxInfo) => {
+          const videoTrack = info.videoTracks[0];
+          if (!videoTrack) {
+            this.log("On-demand build: no video track found");
+            if (!resolved) resolve(null);
+            return;
+          }
+          videoTrackId = videoTrack.id;
+
+          // Compute sample range for this segment based on recorded boundaries
+          const startSample = index === 0 ? 1 : (this.segmentSampleBoundaries[index - 1] + 1);
+          const endSample = this.segmentSampleBoundaries[index];
+          const nbSamples = endSample - startSample + 1;
+
+          // Configure extraction for the specific sample window
+          if (typeof mp4boxFile.setExtractionOptions === "function") {
+            mp4boxFile.setExtractionOptions(videoTrackId, null, {
+              start: startSample,
+              nbSamples,
+              rapAlignement: true
+            });
+          }
+
+          // Use segmentation to emit moof/mdat for the extracted samples
+          mp4boxFile.setSegmentOptions(videoTrackId, null, {
+            startWithSAP: 1,
+            rapAlignement: true,
+            nbSamples
+          });
+          mp4boxFile.initializeSegmentation();
+          mp4boxFile.start();
+        };
+
+        mp4boxFile.onSegment = (_id: number, _user: any, buffer: ArrayBuffer, sampleNum: number) => {
+          if (resolved) return;
+          resolved = true;
+          const blob = new Blob([buffer], { type: "video/iso.segment" });
+          if (videoTrackId !== null) {
+            mp4boxFile.releaseUsedSamples(videoTrackId, sampleNum);
+          }
+          resolve(blob);
+        }
+
+        // Append header
+        const headerBuf = this.headerBuffer.slice(0);
+        (headerBuf as any).fileStart = 0;
+        mp4boxFile.appendBuffer(headerBuf);
+
+        const CHUNK = 1024 * 1024;
+
+        // Feed a byte range into mp4box (targeted or from start)
+        const feedRange = async (start: number, end: number) => {
+          let offset = start;
+          while (offset < end && !resolved) {
+            const sliceEnd = Math.min(offset + CHUNK, end);
+            const buf = await this.file.slice(offset, sliceEnd).arrayBuffer();
+            (buf as any).fileStart = offset;
+            mp4boxFile.appendBuffer(buf);
+            offset = sliceEnd;
+          }
+          mp4boxFile.flush();
+        };
+
+        // First try minimal range (only the segment bytes). If that cannot produce a fragment,
+        // fall back to feeding from file start to this segment end to give mp4box full context.
+        const run = async () => {
+          await feedRange(seg.startByte, seg.endByte);
+          if (!resolved) {
+            this.log(`On-demand build for segment ${index} could not produce a fragment; retrying with full prefix.`);
+            await feedRange(0, seg.endByte);
+            if (!resolved) {
+              this.log(`On-demand build for segment ${index} failed even with full prefix.`);
+              resolve(null);
+            }
+          }
+        };
+
+        run().catch(err => {
+          this.log(`On-demand feed error for segment ${index}: ${err?.message || err}`);
+          if (!resolved) resolve(null);
+        });
+      } catch (err: any) {
+        this.log(`On-demand build exception: ${err?.message || err}`);
+        resolve(null);
+      }
+    });
   }
 
   /**
@@ -472,6 +624,26 @@ export class ChunkstreamEngine {
   private waitForFragment(index: number, timeoutMs = 15000): Promise<Blob | null> {
     const existing = this.segmentFragments.get(index);
     if (existing) return Promise.resolve(existing);
+
+    // Kick off on-demand generation if not already running and fragment not yet produced.
+    if (!this.onDemandGeneration.has(index)) {
+      const genPromise = this.buildFragmentOnDemand(index)
+        .then(blob => {
+          if (blob) {
+            this.segmentFragments.set(index, blob);
+            this.notifyFragmentReady(index, blob);
+          }
+          return blob;
+        })
+        .catch(err => {
+          this.log(`On-demand fragment ${index} failed: ${err?.message || err}`);
+          return null;
+        })
+        .finally(() => {
+          this.onDemandGeneration.delete(index);
+        });
+      this.onDemandGeneration.set(index, genPromise);
+    }
 
     return new Promise(resolve => {
       const waiters = this.fragmentWaiters.get(index) || [];
