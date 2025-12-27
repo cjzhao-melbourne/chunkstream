@@ -3,10 +3,12 @@ import os
 import uuid
 import logging
 import asyncio
+import json
 from datetime import datetime
 from typing import Dict, Any, Set
+from collections import defaultdict
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Response
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -45,6 +47,9 @@ videos_meta: Dict[str, Dict[str, Any]] = {}
 # 调度器实例
 scheduler = UploadScheduler()
 
+# WebSocket 连接：按 video_id 存放所有已连接的 uploader
+uploader_ws_clients: Dict[str, Set[WebSocket]] = defaultdict(set)
+
 # CORS：方便前端本地调试
 app.add_middleware(
     CORSMiddleware,
@@ -67,6 +72,40 @@ async def log_requests(request: Request, call_next):
     response = await call_next(request)
     logger.info(f"RES {datetime.utcnow().isoformat()} {request.method} {request.url.path} status={response.status_code}")
     return response
+
+
+async def broadcast_priority(video_id: str, indexes: Any):
+  """
+  将紧急片段索引推送给所有已连接的 uploader WebSocket。
+  indexes: 可迭代的整数。
+  """
+  clients = uploader_ws_clients.get(video_id)
+  if not clients:
+    return
+  payload = json.dumps({"type": "priority", "indexes": list(indexes)})
+  dead = []
+  for ws in list(clients):
+    try:
+      await ws.send_text(payload)
+    except Exception as e:  # 连接断开/无法发送
+      logger.warning(f"WS send failed for video {video_id}: {e}")
+      dead.append(ws)
+  for ws in dead:
+    clients.discard(ws)
+
+
+def priority_window_indexes(video_id: str, index: int, window_before: int = 2, window_after: int = 5):
+  """
+  生成优先推送的片段索引范围，向前 window_before，向后 window_after。
+  如果已知总片段数，则限制不超过上限。
+  """
+  meta = videos_meta.get(video_id, {})
+  seg_count = meta.get("segment_count")
+  start = max(0, index - window_before)
+  end = index + window_after
+  if seg_count is not None:
+    end = min(end, seg_count - 1)
+  return range(start, end + 1)
 
 # ---------------- API: 初始化视频上传会话 ----------------
 
@@ -132,6 +171,52 @@ async def get_init_segment(video_id: str, request: Request):
         return Response(status_code=304, headers=cache_headers)
 
     return FileResponse(init_path, media_type="video/iso.segment", headers=cache_headers)
+
+
+# ---------------- API: 上传/获取音频初始化片段（audio_init.m4s） ----------------
+
+
+@app.post("/videos/{video_id}/audio/init")
+async def upload_audio_init_segment(video_id: str, init: UploadFile = File(...)):
+    if video_id not in videos_meta:
+        raise HTTPException(status_code=404, detail="video_id 不存在")
+
+    video_dir = videos_meta[video_id]["dir"]
+    init_path = os.path.join(video_dir, "audio_init.m4s")
+
+    with open(init_path, "wb") as f:
+        f.write(await init.read())
+
+    return {"status": "ok"}
+
+
+@app.get("/videos/{video_id}/audio/init.m4s")
+@app.get("/videos/{video_id}/audio_init.m4s")  # manifest uses audio_init.m4s (no /audio/ prefix)
+async def get_audio_init_segment(video_id: str, request: Request):
+    if video_id not in videos_meta:
+        raise HTTPException(status_code=404, detail="video_id 不存在")
+    video_dir = videos_meta[video_id]["dir"]
+    init_path = os.path.join(video_dir, "audio_init.m4s")
+    # Wait briefly for audio init to arrive (e.g., player requests before uploader finishes)
+    max_wait_ms = 4000
+    waited = 0
+    while not os.path.exists(init_path) and waited < max_wait_ms:
+        await asyncio.sleep(0.2)
+        waited += 200
+    if not os.path.exists(init_path):
+        raise HTTPException(status_code=404, detail="audio init segment 不存在")
+
+    stat = os.stat(init_path)
+    etag = f'W/"{stat.st_mtime_ns}-{stat.st_size}"'
+    cache_headers = {
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "ETag": etag,
+    }
+
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=cache_headers)
+
+    return FileResponse(init_path, media_type="audio/mp4", headers=cache_headers)
 
 # ---------------- API: 上传单个片段 ----------------
 
@@ -202,6 +287,7 @@ async def prioritize_segment(video_id: str, req: PriorityRequest):
         await asyncio.sleep(0.2)
 
     await scheduler.bump_priority_around(video_id, req.index)
+    await broadcast_priority(video_id, priority_window_indexes(video_id, req.index))
     return {"status": "ok", "index": req.index}
 
 
@@ -216,6 +302,7 @@ async def prioritize_segment_with_path(video_id: str, index: int):
         await asyncio.sleep(0.2)
 
     await scheduler.bump_priority_around(video_id, index)
+    await broadcast_priority(video_id, priority_window_indexes(video_id, index))
     return {"status": "ok", "index": index}
 
 # ---------------- API: 上传/获取 MPD manifest ----------------
@@ -274,6 +361,38 @@ async def get_segment(video_id: str, index: int):
         raise HTTPException(status_code=404, detail="片段不存在")
     return FileResponse(seg_path, media_type="video/iso.segment")
 
+
+@app.post("/videos/{video_id}/audio/segments/{index}")
+async def upload_audio_segment(video_id: str, index: int, segment: UploadFile = File(...)):
+    if video_id not in videos_meta:
+        raise HTTPException(status_code=404, detail="video_id 不存在")
+
+    video_dir = videos_meta[video_id]["dir"]
+    seg_filename = f"audio_segment_{index}.m4s"
+    seg_path = os.path.join(video_dir, seg_filename)
+
+    with open(seg_path, "wb") as f:
+        f.write(await segment.read())
+
+    return {"status": "ok", "index": index}
+
+
+@app.get("/videos/{video_id}/audio/segment_{index}.m4s")
+@app.get("/videos/{video_id}/audio_segment_{index}.m4s")  # manifest uses audio_segment_*.m4s
+async def get_audio_segment(video_id: str, index: int):
+    if video_id not in videos_meta:
+        raise HTTPException(status_code=404, detail="video_id 不存在")
+    video_dir = videos_meta[video_id]["dir"]
+    seg_path = os.path.join(video_dir, f"audio_segment_{index}.m4s")
+    max_wait_ms = 4000
+    waited = 0
+    while not os.path.exists(seg_path) and waited < max_wait_ms:
+        await asyncio.sleep(0.2)
+        waited += 200
+    if not os.path.exists(seg_path):
+        raise HTTPException(status_code=404, detail="音频片段不存在")
+    return FileResponse(seg_path, media_type="audio/mp4")
+
 # ---------------- API: 注册一个上传客户端（uploader） ----------------
 
 
@@ -285,6 +404,31 @@ async def register_uploader(video_id: str, req: RegisterUploaderRequest):
     uploader_id = str(uuid.uuid4())
     await scheduler.register_uploader(video_id, uploader_id, req.max_concurrency)
     return RegisterUploaderResponse(uploader_id=uploader_id)
+
+# ---------------- WebSocket: 上传端订阅紧急任务 ----------------
+
+
+@app.websocket("/videos/{video_id}/uploaders/{uploader_id}/ws")
+async def uploader_priority_ws(video_id: str, uploader_id: str, websocket: WebSocket):
+    if video_id not in videos_meta:
+        await websocket.close(code=4404)
+        return
+
+    await websocket.accept()
+    clients = uploader_ws_clients[video_id]
+    clients.add(websocket)
+    logger.info(f"WS connected: video {video_id}, uploader {uploader_id}, total={len(clients)}")
+
+    try:
+        # 简单地监听来自客户端的 ping/keepalive；数据内容直接忽略
+        while True:
+            try:
+                await websocket.receive_text()
+            except WebSocketDisconnect:
+                break
+    finally:
+        clients.discard(websocket)
+        logger.info(f"WS disconnected: video {video_id}, uploader {uploader_id}, total={len(clients)}")
 
 # ---------------- API: 上传客户端询问“下一批要上传哪些片段” ----------------
 

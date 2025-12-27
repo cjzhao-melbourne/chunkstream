@@ -38,6 +38,13 @@ export const uploaderService = {
     });
     throwIfNotOk(resp, "Failed to upload init segment");
   },
+  async uploadAudioInit(videoId: string, formData: FormData): Promise<void> {
+    const resp = await fetch(`${BACKEND_BASE}/videos/${videoId}/audio/init`, {
+      method: "POST",
+      body: formData
+    });
+    throwIfNotOk(resp, "Failed to upload audio init segment");
+  },
 
   /*
    initSession(..) is the first call before uploading.
@@ -123,5 +130,15 @@ export const uploaderService = {
       }
     );
     throwIfNotOk(resp, "Failed to upload segment");
+  },
+  async uploadAudioSegment(videoId: string, index: number, formData: FormData): Promise<void> {
+    const resp = await fetch(
+      `${BACKEND_BASE}/videos/${videoId}/audio/segments/${index}`,
+      {
+        method: "POST",
+        body: formData
+      }
+    );
+    throwIfNotOk(resp, "Failed to upload audio segment");
   },
 };

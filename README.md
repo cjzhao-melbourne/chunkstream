@@ -1,6 +1,6 @@
 # Chunkstream
-
-> **Sharing big videos instantly, before they finish uploading.**  
+.
+> **Video share while uploading. Seek instantly**  
 > Frontend MPEG-DASH slicing + backend intelligent upload scheduling.
 
 ---

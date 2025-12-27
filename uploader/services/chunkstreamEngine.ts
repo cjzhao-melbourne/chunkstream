@@ -1,4 +1,4 @@
-import { MP4BoxInfo, MP4File, SegmentInfo, MP4BoxSample, MP4BoxBuffer } from "../types";
+import { MP4BoxInfo, MP4File, SegmentInfo, MP4BoxSample, MP4BoxBuffer, MP4InitSegmentEntry, MP4InitSegmentationResult } from "../types";
 import { uploaderService } from "./uploaderService";
 import { playerService } from "./playerService";
 
@@ -13,12 +13,24 @@ export class ChunkstreamEngine {
   private mp4Info: MP4BoxInfo | null = null;
   private headerBuffer: MP4BoxBuffer | null = null;
   private initFragment: Blob | null = null;
+  private audioInitFragment: Blob | null = null;
   private segmentFragments: Map<number, Blob> = new Map();
+  private audioSegmentFragments: Map<number, Blob> = new Map();
   private fragmentWaiters: Map<number, ((blob: Blob) => void)[]> = new Map();
+  private audioFragmentWaiters: Map<number, ((blob: Blob) => void)[]> = new Map();
   private onDemandGeneration: Map<number, Promise<Blob | null>> = new Map();
+  private priorityQueue: number[] = [];
+  private priorityQueueSet: Set<number> = new Set();
+  private nextSequentialIndex = 0;
+  private prioritySocket: WebSocket | null = null;
+  private prioritySocketReconnectTimer: number | null = null;
+  private prioritySocketHeartbeatTimer: number | null = null;
   private fragmentGenerationDone = false;
+  private audioSegmentCount = 0;
   private segments: SegmentInfo[] = [];
   private segmentSampleBoundaries: number[] = [];
+  private audioSegmentBoundaries: number[] = [];
+  private audioSamples: MP4BoxSample[] = [];
   private inFlight = new Set<number>();
   private stopRequested = false;
   private totalDurationSec = 0;
@@ -60,16 +72,21 @@ export class ChunkstreamEngine {
         throw new Error("No video track found when building init segment");
       }
 
-      // 2) Start streaming fragmenter (produces moof/mdat progressively)
-      this.initFragment =await this.startStreamingFragmenter(this.segments);
-
-      // 3) Backend session
-      const { video_id } = await uploaderService.initSession(
+      // 2) Kick off fragmenter and backend session in parallel
+      const fragmenterPromise = this.startStreamingFragmenter(this.segments, info);
+      const sessionPromise = uploaderService.initSession(
         this.file.name,
         this.file.size,
         segments.length,
         this.segmentDuration
       );
+      const [{ videoInit, audioInit, audioSegmentCount }, { video_id }] = await Promise.all([
+        fragmenterPromise,
+        sessionPromise,
+      ]);
+      this.initFragment = videoInit;
+      this.audioInitFragment = audioInit || null;
+      this.audioSegmentCount = audioInit ? audioSegmentCount : 0;
       this.videoId = video_id;
       this.log(`Session initialized. Video ID: ${this.videoId}`);
 
@@ -83,11 +100,18 @@ export class ChunkstreamEngine {
      formData.append("init", this.initFragment, "init.m4s");
      await uploaderService.uploadInit(this.videoId, formData);
      this.log(`Init segment uploaded .`);
+     if (this.audioInitFragment) {
+       const audioForm = new FormData();
+       audioForm.append("init", this.audioInitFragment, "audio_init.m4s");
+       await uploaderService.uploadAudioInit(this.videoId, audioForm);
+      this.log("Audio init segment uploaded.");
+    }
       
       // 5) Register uploader and start scheduling loop (uploads in background)
       const { uploader_id } = await uploaderService.registerUploader(this.videoId, this.maxConcurrency);
       this.uploaderId = uploader_id;
       this.log(`Uploader registered. ID: ${this.uploaderId}`);
+      this.connectPrioritySocket();
       this.scheduleLoop();
 
       // 6) Upload MPD immediately after init
@@ -108,6 +132,7 @@ export class ChunkstreamEngine {
 
   stop() {
     this.stopRequested = true;
+    this.cleanupPrioritySocket();
   }
 
   /**
@@ -133,19 +158,52 @@ export class ChunkstreamEngine {
 
       // MP4Box.getInfo() does not include the built sample list; fetch it from the MP4File track.
       const videoTrack = mp4.getTrackById(videoTrackInfo.id);
-      const samples = videoTrack?.samples || [];
-      if (samples.length === 0) {
+      const videoSamples = videoTrack?.samples || [];
+      if (videoSamples.length === 0) {
         throw new Error("Sample table (stsz/stco) missing; cannot virtual slice. Please remux the file (faststart).");
       }
-      this.log(`stsz/stco samples parsed: ${samples.length}`);       
+      this.log(`stsz/stco samples parsed (video): ${videoSamples.length}`);       
 
       const trackTimescale = videoTrack.timescale || videoTrackInfo.timescale || info.timescale;
       const totalDuration = info.duration / info.timescale;
-      const { segments, boundaries } = this.buildSegmentsFromSamples(samples, trackTimescale, totalDuration);
+      let { segments, boundaries } = this.buildSegmentsFromSamples(videoSamples, trackTimescale, totalDuration);
       if (segments.length === 0) {
         throw new Error("No segments were constructed from the sample table.");
       }
       this.segmentSampleBoundaries = boundaries;
+
+      // If any segment is overly large, shrink segmentDuration based on bitrate and rebuild.
+      const MAX_SEGMENT_BYTES = 32 * 1024 * 1024; // cap per-segment size for on-demand safety
+      const maxSegBytes = Math.max(...segments.map(s => s.endByte - s.startByte));
+      if (maxSegBytes > MAX_SEGMENT_BYTES) {
+        const estBitrate = videoTrackInfo.bitrate || ((this.file.size * 8) / totalDuration);
+        if (estBitrate > 0 && Number.isFinite(estBitrate)) {
+          const targetDuration = Math.max(1, Math.floor((MAX_SEGMENT_BYTES * 8) / estBitrate));
+          if (targetDuration < this.segmentDuration) {
+            this.log(`Segment size ${ (maxSegBytes / (1024 * 1024)).toFixed(1) }MB exceeds cap; shrink segmentDuration to ${targetDuration}s.`);
+            this.segmentDuration = targetDuration;
+            const rebuilt = this.buildSegmentsFromSamples(videoSamples, trackTimescale, totalDuration, this.segmentDuration);
+            segments = rebuilt.segments;
+            boundaries = rebuilt.boundaries;
+            this.segmentSampleBoundaries = boundaries;
+          }
+        }
+      }
+
+      // Build corresponding audio segment boundaries aligned to video segment end times
+      const audioTrackInfo = info.audioTracks?.[0];
+      if (audioTrackInfo) {
+        const audioTrack = mp4.getTrackById(audioTrackInfo.id);
+        const audioSamples = audioTrack?.samples || [];
+        const audioTimescale = audioTrack?.timescale || audioTrackInfo.timescale || info.timescale;
+        this.audioSamples = audioSamples;
+        this.audioSegmentBoundaries = this.buildAudioBoundariesFromTimes(
+          audioSamples,
+          audioTimescale,
+          segments.map(s => s.endTime)
+        );
+        this.log(`Audio segment boundaries constructed: ${this.audioSegmentBoundaries.length}`);
+      }
 
       if (!header) {
         throw new Error("Failed to receive MP4 header buffer from loadMoovOnly");
@@ -155,7 +213,12 @@ export class ChunkstreamEngine {
     });
   }
 
-  private buildSegmentsFromSamples(samples: MP4BoxSample[], timescale: number, totalDuration: number): { segments: SegmentInfo[]; boundaries: number[] } {
+  private buildSegmentsFromSamples(
+    samples: MP4BoxSample[],
+    timescale: number,
+    totalDuration: number,
+    segmentDuration: number = this.segmentDuration
+  ): { segments: SegmentInfo[]; boundaries: number[] } {
     if (!samples || samples.length === 0) {
       throw new Error("No samples available to build segments.");
     }
@@ -179,7 +242,7 @@ export class ChunkstreamEngine {
       
       const elapsed = s.dts / timescale - currentSegStartTime;
 
-      if (s.is_sync && elapsed >= this.segmentDuration * 0.75) {
+      if (s.is_sync && elapsed >= segmentDuration * 0.75) {
         // boundaryIndex：starting point for next segment
         const boundaryIndex = i;
 
@@ -223,6 +286,24 @@ export class ChunkstreamEngine {
     return { segments, boundaries };
   }
 
+  // For audio: align segment boundaries to video segment end times by picking the last audio sample at/just before each boundary.
+  private buildAudioBoundariesFromTimes(audioSamples: MP4BoxSample[], timescale: number, endTimes: number[]): number[] {
+    if (!audioSamples || audioSamples.length === 0) return [];
+    const boundaries: number[] = [];
+    let ptr = 0;
+    const eps = 0.000001; // small tolerance
+    for (const endTime of endTimes) {
+      while (
+        ptr < audioSamples.length - 1 &&
+        audioSamples[ptr].dts / timescale < endTime - eps
+      ) {
+        ptr += 1;
+      }
+      boundaries.push(audioSamples[Math.min(ptr, audioSamples.length - 1)].number);
+    }
+    return boundaries;
+  }
+
   private generateDASHManifest(info: MP4BoxInfo, segments: SegmentInfo[]): string {
     const duration = (info.duration / info.timescale).toFixed(2);
     // Assuming AVC1 video for MVP, retrieving real codec string from MP4Box is better
@@ -234,31 +315,53 @@ export class ChunkstreamEngine {
     const timescale = videoTrack?.timescale || info.timescale || 1;
 
     // Build SegmentTimeline entries (s, d, r syntax)
-    const timelineParts: string[] = [];
-    let prevD: number | null = null;
-    let run = 0;
-    const flush = () => {
-      if (prevD == null) return;
-      const r = run > 1 ? ` r="${run - 1}"` : "";
-      timelineParts.push(`<S d="${prevD}"${r}/>`); 
-    };
-    for (const seg of segments) {
-      const dTicks = Math.max(1, Math.round((seg.endTime - seg.startTime) * timescale));
-      if (prevD === null) {
-        prevD = dTicks;
-        run = 1;
-      } else if (dTicks === prevD) {
-        run += 1;
-      } else {
-        flush();
-        prevD = dTicks;
-        run = 1;
+    const buildTimeline = (scale: number) => {
+      const parts: string[] = [];
+      let prevD: number | null = null;
+      let run = 0;
+      const flush = () => {
+        if (prevD == null) return;
+        const r = run > 1 ? ` r="${run - 1}"` : "";
+        parts.push(`<S d="${prevD}"${r}/>`); 
+      };
+      for (const seg of segments) {
+        const dTicks = Math.max(1, Math.round((seg.endTime - seg.startTime) * scale));
+        if (prevD === null) {
+          prevD = dTicks;
+          run = 1;
+        } else if (dTicks === prevD) {
+          run += 1;
+        } else {
+          flush();
+          prevD = dTicks;
+          run = 1;
+        }
       }
-    }
-    flush();
-    const timelineXml = timelineParts.join("\n        ");
+      flush();
+      return parts.join("\n        ");
+    };
+
+    const timelineXml = buildTimeline(timescale);
     
     // Static DASH MPD with accurate SegmentTimeline
+    const audioTrack = info.audioTracks?.[0];
+    const audioCodec = audioTrack?.codec || "mp4a.40.2";
+    const audioTimescale = audioTrack?.timescale || info.timescale || 48000;
+    const audioTimeline = buildTimeline(audioTimescale);
+
+    const audioAdaptation = audioTrack && this.audioInitFragment
+      ? `
+    <AdaptationSet mimeType="audio/mp4" segmentAlignment="true" lang="${audioTrack.language || "und"}">
+      <Representation id="a1" BANDWIDTH="${audioTrack.bitrate || 128000}" codecs="${audioCodec}">
+        <SegmentTemplate initialization="audio_init.m4s" timescale="${audioTimescale}" media="audio_segment_$Number$.m4s" startNumber="0">
+          <SegmentTimeline>
+        ${audioTimeline}
+          </SegmentTimeline>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>`
+      : "";
+
     return `<?xml version="1.0" encoding="UTF-8"?>
 <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" minBufferTime="PT2S" mediaPresentationDuration="PT${duration}S" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
   <Period id="1" start="PT0S">
@@ -271,17 +374,70 @@ export class ChunkstreamEngine {
         </SegmentTemplate>
       </Representation>
     </AdaptationSet>
+    ${audioAdaptation}
   </Period>
 </MPD>`;
   }
 
+  private enqueuePriorityTask(index: number) {
+    if (index < 0 || index >= this.segments.length) return;
+    if (this.priorityQueueSet.has(index)) return;
+    if (this.inFlight.has(index)) return;
+    const seg = this.segments[index];
+    if (seg?.status === "completed") return;
+    this.priorityQueue.push(index);
+    this.priorityQueueSet.add(index);
+    this.log(`Priority task queued: segment ${index}`);
+  }
+
+  private takePriorityTasks(capacity: number): number[] {
+    const picked: number[] = [];
+    while (picked.length < capacity && this.priorityQueue.length > 0) {
+      const idx = this.priorityQueue.shift()!;
+      this.priorityQueueSet.delete(idx);
+      const seg = this.segments[idx];
+      if (!seg || seg.status === "completed" || this.inFlight.has(idx)) {
+        continue;
+      }
+      picked.push(idx);
+    }
+    return picked;
+  }
+
+  private takeSequentialTasks(capacity: number): number[] {
+    const picked: number[] = [];
+    const tryPick = (start: number, end: number) => {
+      for (let i = start; i < end && picked.length < capacity; i++) {
+        const seg = this.segments[i];
+        if (!seg) continue;
+        if (seg.status === "completed") continue;
+        if (this.inFlight.has(seg.index)) continue;
+        if (this.priorityQueueSet.has(seg.index)) continue;
+        picked.push(seg.index);
+        this.nextSequentialIndex = i + 1;
+      }
+    };
+
+    // Primary pass: continue from where we left off.
+    tryPick(this.nextSequentialIndex, this.segments.length);
+
+    // If we ran out but still have capacity (e.g., retry pending/error ones), wrap to the start.
+    if (picked.length < capacity && this.nextSequentialIndex >= this.segments.length) {
+      this.nextSequentialIndex = 0;
+      tryPick(0, this.segments.length);
+    }
+
+    return picked;
+  }
+
   private async scheduleLoop() {
-    this.log("Starting scheduling loop...");
+    this.log("Starting scheduling loop (sequential uploads + priority overrides)...");
     while (!this.stopRequested) {
       // Check if all done
       const allDone = this.segments.every(s => s.status === 'completed');
       if (allDone) {
         this.log("All segments uploaded!");
+        this.stopRequested = true; // stop auxiliary loops like priority polling
         break;
       }
 
@@ -291,46 +447,119 @@ export class ChunkstreamEngine {
         continue;
       }
 
-      try {
-    const { tasks } = await uploaderService.getNextTasks(
-      this.videoId!, 
-      this.uploaderId!, 
-      slotsAvailable, 
-      Array.from(this.inFlight)
-        );
+      // Priority tasks come first, then fall back to sequential uploading.
+      const tasks: number[] = [
+        ...this.takePriorityTasks(slotsAvailable),
+        ...this.takeSequentialTasks(slotsAvailable),
+      ].slice(0, slotsAvailable);
 
-        if (!tasks || tasks.length === 0) {
-          await this.sleep(1000); // Wait for tasks
-          continue;
-        }
+      if (tasks.length === 0) {
+        await this.sleep(400);
+        continue;
+      }
 
-        for (const task of tasks) {
-          if (this.inFlight.has(task.index)) continue;
-          
-          // Mark as uploading
-          this.updateSegmentStatus(task.index, 'uploading');
-          this.inFlight.add(task.index);
-          
-          // Trigger upload (async, don't await here to allow concurrency)
-          this.processTask(task.index).catch(err => {
-            this.log(`Task ${task.index} failed: ${err.message}`);
-            this.updateSegmentStatus(task.index, 'error');
-          }).finally(() => {
-            this.inFlight.delete(task.index);
-          });
-        }
+      for (const index of tasks) {
+        if (this.inFlight.has(index)) continue;
 
-      } catch (e) {
-        console.error(e);
-        await this.sleep(2000);
+        this.updateSegmentStatus(index, 'uploading');
+        this.inFlight.add(index);
+
+        // Trigger upload (async, don't await here to allow concurrency)
+        this.processTask(index).catch(err => {
+          this.log(`Task ${index} failed: ${err.message}`);
+          this.updateSegmentStatus(index, 'error');
+        }).finally(() => {
+          this.inFlight.delete(index);
+        });
       }
     }
+    this.cleanupPrioritySocket();
+  }
+
+  private connectPrioritySocket() {
+    if (!this.videoId || !this.uploaderId) return;
+    const wsUrl = this.buildWebSocketUrl();
+    if (!wsUrl) {
+      this.log("Priority WS URL unavailable; skip WebSocket setup");
+      return;
+    }
+    const ws = new WebSocket(wsUrl);
+    this.prioritySocket = ws;
+
+    ws.onopen = () => {
+      this.log("Priority WebSocket connected.");
+      // Heartbeat to keep server-side receive loop alive
+      this.prioritySocketHeartbeatTimer = window.setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send("ping");
+        }
+      }, 20000);
+    };
+
+    ws.onmessage = (event: MessageEvent) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data?.type === "priority" && Array.isArray(data.indexes)) {
+          // New priority set replaces the old queue for faster response to latest seek
+          this.priorityQueue = [];
+          this.priorityQueueSet.clear();
+          data.indexes.forEach((idx: number) => this.enqueuePriorityTask(idx));
+        }
+      } catch (err) {
+        console.warn("Failed to parse priority WS message", err);
+      }
+    };
+
+    ws.onclose = () => {
+      this.prioritySocket = null;
+      if (this.prioritySocketHeartbeatTimer !== null) {
+        clearInterval(this.prioritySocketHeartbeatTimer);
+        this.prioritySocketHeartbeatTimer = null;
+      }
+      if (this.stopRequested) return;
+      // attempt reconnect after a short delay
+      this.prioritySocketReconnectTimer = window.setTimeout(() => this.connectPrioritySocket(), 1500);
+    };
+
+    ws.onerror = (ev: Event) => {
+      console.error("Priority WS error", ev);
+      ws.close();
+    };
+  }
+
+  private cleanupPrioritySocket() {
+    if (this.prioritySocket) {
+      this.prioritySocket.close();
+      this.prioritySocket = null;
+    }
+    if (this.prioritySocketHeartbeatTimer !== null) {
+      clearInterval(this.prioritySocketHeartbeatTimer);
+      this.prioritySocketHeartbeatTimer = null;
+    }
+    if (this.prioritySocketReconnectTimer !== null) {
+      clearTimeout(this.prioritySocketReconnectTimer);
+      this.prioritySocketReconnectTimer = null;
+    }
+  }
+
+  private buildWebSocketUrl(): string | null {
+    const backendBase =
+      (import.meta as any)?.env?.VITE_BACKEND_BASE ||
+      (typeof window !== "undefined" ? (window as any).__CHUNKSTREAM_BACKEND_BASE__ : undefined) ||
+      "http://127.0.0.1:8000";
+    if (!backendBase) return null;
+    const normalized = backendBase.replace(/\/$/, "");
+    const wsBase = normalized.replace(/^http(s?)/i, (_m, s) => (s ? "wss" : "ws"));
+    return `${wsBase}/videos/${this.videoId}/uploaders/${this.uploaderId}/ws`;
   }
 
   private async processTask(index: number) {
     const segment = this.segments.find(s => s.index === index);
     if (!segment) return;
-    const fragment = await this.waitForFragment(index, 20000);
+    const [fragment, audioFragment] = await Promise.all([
+      this.waitForVideoFragment(index, 20000),
+      this.audioSegmentCount > 0 ? this.waitForAudioFragment(index, 20000) : Promise.resolve(null)
+    ]);
     if (!fragment) {
       this.log(`Segment ${index} not ready, will retry`);
       this.updateSegmentStatus(index, 'pending');
@@ -347,11 +576,25 @@ export class ChunkstreamEngine {
 
     await uploaderService.uploadSegment(this.videoId!, index, formData);
     
+    if (this.audioSegmentCount > 0) {
+      if (audioFragment) {
+        const audioForm = new FormData();
+        audioForm.append("segment", audioFragment, `audio_segment_${index}.m4s`);
+        audioForm.append("index", index.toString());
+        await uploaderService.uploadAudioSegment(this.videoId!, index, audioForm);
+      } else {
+        this.log(`Audio fragment ${index} not ready; video uploaded without audio.`);
+      }
+    }
+    
     this.updateSegmentStatus(index, 'completed');
     this.log(`Segment ${index} uploaded.`);
 
     // Free memory after upload
     this.segmentFragments.delete(index);
+    if (this.audioSegmentCount > 0) {
+      this.audioSegmentFragments.delete(index);
+    }
   }
 
   private updateSegmentStatus(index: number, status: SegmentInfo['status']) {
@@ -392,15 +635,15 @@ export class ChunkstreamEngine {
    * Build a specific fragment on-demand by reading only the byte range for that segment.
    * Useful when a high-index segment is requested before sequential generation reaches it.
    */
-  private async buildFragmentOnDemand(index: number): Promise<Blob | null> {
+  private async buildFragmentOnDemand(index: number): Promise<void> {
     if (!this.headerBuffer || !this.mp4Info) {
       this.log("On-demand build skipped: missing header/mp4 info");
-      return null;
+      return;
     }
     const seg = this.segments.find(s => s.index === index);
     if (!seg) {
       this.log(`On-demand build skipped: segment ${index} not found`);
-      return null;
+      return;
     }
 
     const MP4Box = (window as any).MP4Box;
@@ -409,22 +652,32 @@ export class ChunkstreamEngine {
       return null;
     }
 
-    return new Promise<Blob | null>((resolve) => {
+    return new Promise<void>((resolve) => {
       try {
         const mp4boxFile = MP4Box.createFile();
         let videoTrackId: number | null = null;
-        let resolved = false;
+        let audioTrackId: number | null = null;
+        let videoReady = false;
+        let audioReady = false;
+        let audioExpected = false;
+        let completed = false;
+        // Promise 只用来收尾生命周期，真正的数据分发走 notifyFragmentReady/notifyAudioFragmentReady。
+        const finish = () => {
+          if (completed) return;
+          completed = true;
+          resolve();
+        };
 
         mp4boxFile.onError = (e: any) => {
           this.log(`on-demand mp4box error: ${typeof e === "string" ? e : e?.message || "unknown"}`);
-          if (!resolved) resolve(null);
+          finish();
         };
 
         mp4boxFile.onReady = (info: MP4BoxInfo) => {
           const videoTrack = info.videoTracks[0];
           if (!videoTrack) {
             this.log("On-demand build: no video track found");
-            if (!resolved) resolve(null);
+            finish();
             return;
           }
           videoTrackId = videoTrack.id;
@@ -443,67 +696,151 @@ export class ChunkstreamEngine {
             });
           }
 
-          // Use segmentation to emit moof/mdat for the extracted samples
-          mp4boxFile.setSegmentOptions(videoTrackId, null, {
-            startWithSAP: 1,
-            rapAlignement: true,
-            nbSamples
-          });
+          // Audio track setup (if available)
+          const audioTrack = info.audioTracks?.[0];
+          if (audioTrack && this.audioSegmentBoundaries.length > index) {
+            audioTrackId = audioTrack.id;
+            audioExpected = true;
+            const audioStartSample = index === 0 ? 1 : (this.audioSegmentBoundaries[index - 1] + 1);
+            const audioEndSample = this.audioSegmentBoundaries[index];
+            const audioNbSamples = audioEndSample - audioStartSample + 1;
+
+            if (typeof mp4boxFile.setExtractionOptions === "function") {
+              mp4boxFile.setExtractionOptions(audioTrackId, null, {
+                start: audioStartSample,
+                nbSamples: audioNbSamples,
+                rapAlignement: true
+              });
+            }
+
+            if (typeof mp4boxFile.setExternalSegmentBoundaries === "function") {
+              mp4boxFile.setExternalSegmentBoundaries(
+                audioTrackId,
+                null,
+                [audioEndSample],
+                { rapAlignement: true }
+              );
+            } else {
+              this.log("mp4box.setExternalSegmentBoundaries not available for audio on-demand; skipping.");
+            }
+          }
+
+          // Use explicit boundaries for the requested window to emit moof/mdat
+          if (typeof mp4boxFile.setExternalSegmentBoundaries === "function") {
+            mp4boxFile.setExternalSegmentBoundaries(
+              videoTrackId,
+              null,
+              [endSample],
+              { rapAlignement: true }
+            );
+          } else {
+            this.log("mp4box.setExternalSegmentBoundaries not available; on-demand segment may not align to seek.");
+          }
           mp4boxFile.initializeSegmentation();
           mp4boxFile.start();
         };
 
-        mp4boxFile.onSegment = (_id: number, _user: any, buffer: ArrayBuffer, sampleNum: number) => {
-          if (resolved) return;
-          resolved = true;
-          const blob = new Blob([buffer], { type: "video/iso.segment" });
-          if (videoTrackId !== null) {
-            mp4boxFile.releaseUsedSamples(videoTrackId, sampleNum);
+        mp4boxFile.onSegment = (id: number, _user: any, buffer: ArrayBuffer, sampleNum: number) => {
+          const isVideo = videoTrackId !== null && id === videoTrackId;
+          const isAudio = audioTrackId !== null && id === audioTrackId;
+          if (!isVideo && !isAudio) return;
+
+          const blob = new Blob([buffer], { type: isVideo ? "video/iso.segment" : "audio/mp4" });
+          if (isVideo) {
+            videoReady = true;
+            this.segmentFragments.set(index, blob);
+            this.notifyFragmentReady(index, blob);
+            if (videoTrackId !== null) {
+              mp4boxFile.releaseUsedSamples(videoTrackId, sampleNum);
+            }
+            finish();
+          } else {
+            // audio
+            audioReady = true;
+            this.audioSegmentFragments.set(index, blob);
+            this.notifyAudioFragmentReady(index, blob);
+            if (audioTrackId !== null) {
+              mp4boxFile.releaseUsedSamples(audioTrackId, sampleNum);
+            }
           }
-          resolve(blob);
-        }
+        };
 
         // Append header
         const headerBuf = this.headerBuffer.slice(0);
         (headerBuf as any).fileStart = 0;
         mp4boxFile.appendBuffer(headerBuf);
 
-        const CHUNK = 1024 * 1024;
+        // Use moderate chunks and cap total bytes per run to avoid large ArrayBuffer allocations.
+        const CHUNK = 512 * 1024;
+        const MAX_BYTES_PER_RUN = 64 * 1024 * 1024;
 
         // Feed a byte range into mp4box (targeted or from start)
-        const feedRange = async (start: number, end: number) => {
+        const feedRange = async (start: number, end: number): Promise<boolean> => {
           let offset = start;
-          while (offset < end && !resolved) {
+          let fed = 0;
+          while (offset < end) {
             const sliceEnd = Math.min(offset + CHUNK, end);
-            const buf = await this.file.slice(offset, sliceEnd).arrayBuffer();
-            (buf as any).fileStart = offset;
-            mp4boxFile.appendBuffer(buf);
+            try {
+              const buf = await this.file.slice(offset, sliceEnd).arrayBuffer();
+              (buf as any).fileStart = offset;
+              mp4boxFile.appendBuffer(buf);
+            } catch (err: any) {
+              this.log(`On-demand feed error reading range [${offset}, ${sliceEnd}): ${err?.message || err}`);
+              return false;
+            }
+            fed += sliceEnd - offset;
             offset = sliceEnd;
+            if (fed > MAX_BYTES_PER_RUN) {
+              this.log(`On-demand feed aborted: exceeded max bytes per run (${MAX_BYTES_PER_RUN} bytes).`);
+              return false;
+            }
           }
           mp4boxFile.flush();
+          return true;
         };
 
         // First try minimal range (only the segment bytes). If that cannot produce a fragment,
-        // fall back to feeding from file start to this segment end to give mp4box full context.
+        // fall back to a bounded prefix window near the segment to avoid huge allocations.
         const run = async () => {
-          await feedRange(seg.startByte, seg.endByte);
-          if (!resolved) {
-            this.log(`On-demand build for segment ${index} could not produce a fragment; retrying with full prefix.`);
-            await feedRange(0, seg.endByte);
-            if (!resolved) {
-              this.log(`On-demand build for segment ${index} failed even with full prefix.`);
-              resolve(null);
+          // For multi-track safety, extend range to cover audio bytes if known
+          const audioRange = this.computeAudioByteRange(index);
+          const readStart = Math.max(0, Math.min(seg.startByte, audioRange?.startByte ?? seg.startByte));
+          const readEnd = Math.min(this.file.size, Math.max(seg.endByte, audioRange?.endByte ?? seg.endByte));
+
+          const ok = await feedRange(readStart, readEnd);
+          if (!ok) {
+            finish();
+            return;
+          }
+          let fragmentComplete = videoReady && (!audioExpected || audioReady);
+          if (!fragmentComplete) {
+            // Avoid reading the entire file; limit fallback to a sliding window before the target end.
+            const FALLBACK_WINDOW = 64 * 1024 * 1024; // 64MB cap to prevent giant ArrayBuffer allocations
+            const fallbackStart = Math.max(0, readEnd - FALLBACK_WINDOW);
+            this.log(`On-demand build for segment ${index} incomplete; retrying with bounded prefix [${fallbackStart}, ${readEnd}).`);
+            const okFallback = await feedRange(fallbackStart, readEnd);
+            if (!okFallback) {
+              finish();
+              return;
             }
+            fragmentComplete = videoReady && (!audioExpected || audioReady);
+            if (!fragmentComplete) {
+              this.log(`On-demand build for segment ${index} failed even with full prefix.`);
+              finish();
+            }
+          }
+          if (fragmentComplete) {
+            finish();
           }
         };
 
         run().catch(err => {
           this.log(`On-demand feed error for segment ${index}: ${err?.message || err}`);
-          if (!resolved) resolve(null);
+          finish();
         });
       } catch (err: any) {
         this.log(`On-demand build exception: ${err?.message || err}`);
-        resolve(null);
+        finish();
       }
     });
   }
@@ -512,7 +849,7 @@ export class ChunkstreamEngine {
    * Streaming fragmentation with mp4box.js: reads file in small chunks and emits segments progressively.
    * 
    */
-  private startStreamingFragmenter(segments: SegmentInfo[]): Promise<Blob> {
+  private startStreamingFragmenter(segments: SegmentInfo[], info: MP4BoxInfo): Promise<{ videoInit: Blob; audioInit?: Blob; audioSegmentCount: number }> {
     const MP4Box = (window as any).MP4Box;
     if (!MP4Box || typeof MP4Box.createFile !== "function") {
       throw new Error("mp4box.js not available");
@@ -524,7 +861,9 @@ export class ChunkstreamEngine {
 
          const mp4boxFile = MP4Box.createFile();
          let videoTrackId: number | null = null;
+         let audioTrackId: number | null = null;
          let segmentIndex = 0;
+         let audioSegmentIndex = 0;
 
          const CHUNK_SIZE = 1024 * 1024; // 1MB per read
 
@@ -554,6 +893,8 @@ export class ChunkstreamEngine {
           }
           
            videoTrackId = videoTrack.id;
+           const audioTrack = info.audioTracks?.[0];
+           audioTrackId = audioTrack ? audioTrack.id : null;
            if (typeof mp4boxFile.setExternalSegmentBoundaries === "function" && this.segmentSampleBoundaries.length > 0) {
            mp4boxFile.setExternalSegmentBoundaries(videoTrackId, null, this.segmentSampleBoundaries, { rapAlignement: true });
            this.log(`Segmenter using external boundaries count=${this.segmentSampleBoundaries.length}`);
@@ -573,35 +914,99 @@ export class ChunkstreamEngine {
            rapAlignement: true
            });
            }
-           // Initialize segmentation so mp4box starts emitting moof/mdat in onSegment; init is built separately from cached header.
-           const initSegs = mp4boxFile.initializeSegmentation();
-           const initInfo =
-             (initSegs as any)?.buffer
-               ? (initSegs as any)
-               : (initSegs as any)?.[videoTrackId] ?? (initSegs ? Object.values(initSegs as any)[0] : undefined);
-           if (!initInfo?.buffer) {
-            const availableKeys = initSegs ? Object.keys(initSegs).join(",") : "none";
-            this.log(`initializeSegmentation returned no buffer; trackId=${videoTrackId} available=${availableKeys}. Falling back to header-based init build.`);
-            
-            return;
-             
+           if (audioTrackId) {
+             const audioTimescale = audioTrack?.timescale || info.timescale || 48000;
+             if (typeof mp4boxFile.setExternalSegmentBoundaries === "function" && this.audioSegmentBoundaries.length > 0) {
+               mp4boxFile.setExternalSegmentBoundaries(audioTrackId, null, this.audioSegmentBoundaries, { rapAlignement: true });
+               this.log(`Audio segmenter using external boundaries count=${this.audioSegmentBoundaries.length}`);
+             } else {
+               const fragDuration = Math.max(1, Math.round(this.segmentDuration * audioTimescale));
+               mp4boxFile.setSegmentOptions(audioTrackId, null, {
+                 fragmentDuration: fragDuration,
+                 rapAlignement: true
+               });
+               this.log(`Audio segmenter fallback: fragmentDuration=${fragDuration} timescale=${audioTimescale}`);
+             }
            }
-           mp4boxFile.start();
-           resolve(new Blob([initInfo.buffer], { type: "video/iso.segment" }));
+           // Initialize segmentation so mp4box starts emitting moof/mdat in onSegment; init is built separately from cached header.
+           // Build init segments per track. Prefer new mp4box.initializeTrackSegmentation(trackId) when available.
+           const trackInitMap = new Map<number, ArrayBuffer>();
+           let combinedInitSegs: MP4InitSegmentationResult | null = null;
+           const ensureCombinedInits = () => {
+             if (combinedInitSegs) return;
+             combinedInitSegs = mp4boxFile.initializeSegmentation() as MP4InitSegmentationResult;
+             const trackEntries = Array.isArray(combinedInitSegs?.tracks) ? combinedInitSegs.tracks : [];
+             trackInitMap.clear();
+             for (const t of trackEntries) {
+               if (t?.id != null && t.buffer) {
+                 trackInitMap.set(t.id, t.buffer);
+               }
+             }
            };
 
-           mp4boxFile.onSegment = (_id: number, _user: any, buffer: ArrayBuffer, sampleNum: number, isLast: boolean) => {
-     
-           const blob = new Blob([buffer], { type: "video/iso.segment" });
-           this.segmentFragments.set(segmentIndex, blob);
-           this.notifyFragmentReady(segmentIndex, blob);
-           this.log(`notify Fragment:${segmentIndex}`);
-           segmentIndex += 1;
-           if (videoTrackId !== null) {
-           mp4boxFile.releaseUsedSamples(videoTrackId, sampleNum);
+           const pickInit = (trackId: number | null | undefined) => {
+             if (trackId == null) return undefined;
+             if (typeof mp4boxFile.initializeTrackSegmentation === "function") {
+               const single = mp4boxFile.initializeTrackSegmentation(trackId) as MP4InitSegmentationResult;
+               if (single?.buffer) return { id: trackId, buffer: single.buffer };
+               const nested = Array.isArray(single?.tracks)
+                 ? single.tracks.find((t) => t?.buffer)
+                 : undefined;
+               if (nested?.buffer) return { id: trackId, buffer: nested.buffer };
+             }
+             ensureCombinedInits();
+             if (trackInitMap.has(trackId)) {
+               return { id: trackId, buffer: trackInitMap.get(trackId)! };
+             }
+             return undefined;
+           };
+
+           const initInfo = pickInit(videoTrackId);
+           // For audio, only accept track-specific init (no generic fallback), to avoid mixed-track init buffers.
+           const audioInitInfo = audioTrackId ? pickInit(audioTrackId) : undefined;
+
+           if (!initInfo?.buffer) {
+            const availableKeys = trackInitMap.size
+              ? Array.from(trackInitMap.keys()).join(",")
+              : "none";
+            const msg = `initializeSegmentation returned no buffer; trackId=${videoTrackId} available=${availableKeys}. Falling back to header-based init build.`;
+            this.log(msg);
+            reject(new Error(msg));
+            return;
            }
-           if (isLast || segmentIndex >= segments.length) {
-           this.fragmentGenerationDone = true;
+           mp4boxFile.start();
+           const videoInit = new Blob([initInfo.buffer], { type: "video/iso.segment" });
+           let audioInit: Blob | undefined;
+           if (audioInitInfo?.buffer) {
+             audioInit = new Blob([audioInitInfo.buffer], { type: "audio/mp4" });
+           }
+           const audioCount = audioInit
+             ? (this.audioSegmentBoundaries.length > 0 ? this.audioSegmentBoundaries.length : this.segments.length)
+             : 0;
+           resolve({ videoInit, audioInit, audioSegmentCount: audioCount });
+           };
+
+           mp4boxFile.onSegment = (id: number, _user: any, buffer: ArrayBuffer, sampleNum: number, isLast: boolean) => {
+           const isVideo = id === videoTrackId;
+           const blob = new Blob([buffer], { type: isVideo ? "video/iso.segment" : "audio/mp4" });
+           if (isVideo) {
+             this.segmentFragments.set(segmentIndex, blob);
+             this.notifyFragmentReady(segmentIndex, blob);
+             this.log(`notify Fragment:${segmentIndex}`);
+             segmentIndex += 1;
+             if (videoTrackId !== null) {
+               mp4boxFile.releaseUsedSamples(videoTrackId, sampleNum);
+             }
+             if (isLast || segmentIndex >= segments.length) {
+               this.fragmentGenerationDone = true;
+             }
+           } else if (id === audioTrackId) {
+             this.audioSegmentFragments.set(audioSegmentIndex, blob);
+             this.notifyAudioFragmentReady(audioSegmentIndex, blob);
+             audioSegmentIndex += 1;
+             if (audioTrackId !== null) {
+               mp4boxFile.releaseUsedSamples(audioTrackId, sampleNum);
+             }
            }
            };
 
@@ -621,29 +1026,46 @@ export class ChunkstreamEngine {
     }
   }
 
-  private waitForFragment(index: number, timeoutMs = 15000): Promise<Blob | null> {
+  private notifyAudioFragmentReady(index: number, blob: Blob) {
+    const waiters = this.audioFragmentWaiters.get(index);
+    if (waiters) {
+      waiters.forEach(res => res(blob));
+      this.audioFragmentWaiters.delete(index);
+    }
+  }
+
+  private computeAudioByteRange(index: number): { startByte: number; endByte: number } | null {
+    if (this.audioSegmentBoundaries.length === 0 || this.audioSamples.length === 0) return null;
+    if (index < 0 || index >= this.audioSegmentBoundaries.length) return null;
+    const startSampleNum = index === 0 ? 1 : (this.audioSegmentBoundaries[index - 1] + 1);
+    const endSampleNum = this.audioSegmentBoundaries[index];
+    const startSample = this.audioSamples.find(s => s.number === startSampleNum);
+    const endSample = this.audioSamples.find(s => s.number === endSampleNum);
+    if (!startSample || !endSample) return null;
+    return {
+      startByte: startSample.offset,
+      endByte: endSample.offset + endSample.size
+    };
+  }
+
+  private ensureOnDemandGeneration(index: number) {
+    if (this.onDemandGeneration.has(index)) return;
+    const genPromise = this.buildFragmentOnDemand(index)
+      .catch(err => {
+        this.log(`On-demand fragment ${index} failed: ${err?.message || err}`);
+      })
+      .finally(() => {
+        this.onDemandGeneration.delete(index);
+      });
+    this.onDemandGeneration.set(index, genPromise);
+  }
+
+  private waitForVideoFragment(index: number, timeoutMs = 15000): Promise<Blob | null> {
     const existing = this.segmentFragments.get(index);
     if (existing) return Promise.resolve(existing);
 
     // Kick off on-demand generation if not already running and fragment not yet produced.
-    if (!this.onDemandGeneration.has(index)) {
-      const genPromise = this.buildFragmentOnDemand(index)
-        .then(blob => {
-          if (blob) {
-            this.segmentFragments.set(index, blob);
-            this.notifyFragmentReady(index, blob);
-          }
-          return blob;
-        })
-        .catch(err => {
-          this.log(`On-demand fragment ${index} failed: ${err?.message || err}`);
-          return null;
-        })
-        .finally(() => {
-          this.onDemandGeneration.delete(index);
-        });
-      this.onDemandGeneration.set(index, genPromise);
-    }
+    this.ensureOnDemandGeneration(index);
 
     return new Promise(resolve => {
       const waiters = this.fragmentWaiters.get(index) || [];
@@ -661,5 +1083,22 @@ export class ChunkstreamEngine {
     });
   }
 
-  
+  private waitForAudioFragment(index: number, timeoutMs = 15000): Promise<Blob | null> {
+    const existing = this.audioSegmentFragments.get(index);
+    if (existing) return Promise.resolve(existing);
+
+    // Trigger on-demand generation if audio missing too.
+    this.ensureOnDemandGeneration(index);
+
+    return new Promise(resolve => {
+      const waiters = this.audioFragmentWaiters.get(index) || [];
+      waiters.push(resolve);
+      this.audioFragmentWaiters.set(index, waiters);
+      setTimeout(() => {
+        const late = this.audioSegmentFragments.get(index);
+        if (late) resolve(late);
+        else resolve(null);
+      }, timeoutMs);
+    });
+  }
 }

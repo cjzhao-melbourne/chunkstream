@@ -12,6 +12,8 @@ export const ProgressBar: React.FC<ProgressBarProps> = ({ segments }) => {
   const completed = segments.filter(s => s.status === 'completed').length;
   const uploading = segments.filter(s => s.status === 'uploading').length;
   const percent = Math.round((completed / total) * 100);
+  // Keep the mini map compact so long timelines fit within ~3 rows.
+  const columns = Math.max(1, Math.min(200, Math.ceil(total / 3)));
 
   return (
     <div className="w-full space-y-2">
@@ -19,7 +21,7 @@ export const ProgressBar: React.FC<ProgressBarProps> = ({ segments }) => {
         <span>Progress</span>
         <span>{percent}% ({completed}/{total})</span>
       </div>
-      <div className="h-4 bg-slate-800 rounded-full overflow-hidden relative flex">
+      <div className="h-3 bg-slate-800 rounded-full overflow-hidden relative flex">
         {/* Completed bar */}
         <div 
           className="h-full bg-emerald-500 transition-all duration-500 ease-out"
@@ -31,7 +33,10 @@ export const ProgressBar: React.FC<ProgressBarProps> = ({ segments }) => {
           style={{ width: `${(uploading / total) * 100}%` }}
         />
       </div>
-      <div className="grid grid-cols-10 gap-0.5 pt-2">
+      <div
+        className="grid gap-px pt-2"
+        style={{ gridTemplateColumns: `repeat(${columns}, minmax(2px, 1fr))` }}
+      >
         {segments.map((seg) => {
             let color = 'bg-slate-800';
             if (seg.status === 'completed') color = 'bg-emerald-500';
@@ -41,7 +46,7 @@ export const ProgressBar: React.FC<ProgressBarProps> = ({ segments }) => {
             return (
                 <div 
                     key={seg.index} 
-                    className={`h-1.5 rounded-sm ${color} transition-colors duration-300`}
+                    className={`h-1 rounded-sm ${color} transition-colors duration-300`}
                     title={`Segment ${seg.index}: ${seg.status}`}
                 />
             )

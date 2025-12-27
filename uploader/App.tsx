@@ -72,6 +72,27 @@ const App: React.FC = () => {
     }
   };
 
+  const handleClosePlayback = () => {
+    setManifestUrl(null);
+    setVideoId(null);
+    addLog("Preview closed by user.");
+  };
+
+  const handleShareLink = async () => {
+    if (!manifestUrl) return;
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(manifestUrl);
+        addLog("Manifest URL copied to clipboard.");
+      } else {
+        window.prompt("Copy manifest URL:", manifestUrl);
+      }
+    } catch (e) {
+      addLog("Failed to copy manifest URL, showing prompt instead.");
+      window.prompt("Copy manifest URL:", manifestUrl);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-slate-900 text-slate-200 p-6 font-sans selection:bg-indigo-500/30">
       <div className="max-w-4xl mx-auto space-y-8">
@@ -143,7 +164,28 @@ const App: React.FC = () => {
           {/* Right: Player */}
           <div className="space-y-6">
              <div className="bg-slate-800/50 p-6 rounded-xl border border-slate-700 h-full flex flex-col">
-                <h2 className="text-xl font-semibold mb-4 text-emerald-300">Preview Player</h2>
+                <div className="flex items-center justify-between mb-4 gap-3">
+                  <h2 className="text-xl font-semibold text-emerald-300">Preview Player</h2>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="secondary"
+                      className="px-3 py-1 text-sm"
+                      onClick={handleShareLink}
+                      disabled={!manifestUrl}
+                      title="Copy manifest URL to share"
+                    >
+                      Share Link
+                    </Button>
+                    <Button
+                      variant="secondary"
+                      className="px-3 py-1 text-sm"
+                      onClick={handleClosePlayback}
+                      disabled={!manifestUrl}
+                    >
+                      Close
+                    </Button>
+                  </div>
+                </div>
                 {manifestUrl ? (
                   <div className="flex-1 flex flex-col justify-center">
                     <VideoPlayer manifestUrl={manifestUrl} videoId={videoId} />

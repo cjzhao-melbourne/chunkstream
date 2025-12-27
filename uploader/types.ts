@@ -81,6 +81,19 @@ export interface MP4BoxBuffer extends ArrayBuffer {
   usedBytes?: number;
 }
 
+export interface MP4InitTrackEntry {
+  id?: number;
+  user?: any;
+  buffer?: ArrayBuffer;
+}
+
+export interface MP4InitSegmentEntry extends MP4InitTrackEntry {
+  tracks?: MP4InitTrackEntry[];
+}
+
+// Some mp4box builds return { buffer, tracks: [...] }; keep optional user/id for compatibility.
+export type MP4InitSegmentationResult = MP4InitSegmentEntry;
+
 export interface MP4File {
   onReady: (info: MP4BoxInfo) => void;
   onError: (e: any) => void;
@@ -92,6 +105,7 @@ export interface MP4File {
   getTrackById: (id: number) => MP4BoxTrack;
   setSegmentOptions: (id: number, user: any, options: any) => void;
   releaseUsedSamples: (id: number, sampleNum: number) => void;
-  initializeSegmentation: () => Record<number, { id: number; user: any; buffer: ArrayBuffer }>;
+  initializeSegmentation: () => MP4InitSegmentationResult;
+  initializeTrackSegmentation?: (trackId: number) => MP4InitSegmentationResult;
   setExternalSegmentBoundaries?: (id: number, user: any, boundarySamples: number[], opts?: { rapAlignement?: boolean }) => void;
 }
