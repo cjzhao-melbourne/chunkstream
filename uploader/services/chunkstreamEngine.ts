@@ -18,7 +18,7 @@ export class ChunkstreamEngine {
   private audioSegmentFragments: Map<number, Blob> = new Map();
   private fragmentWaiters: Map<number, ((blob: Blob) => void)[]> = new Map();
   private audioFragmentWaiters: Map<number, ((blob: Blob) => void)[]> = new Map();
-  private onDemandGeneration: Map<number, Promise<Blob | null>> = new Map();
+  private onDemandGeneration: Map<number, Promise<void>> = new Map();
   private priorityQueue: number[] = [];
   private priorityQueueSet: Set<number> = new Set();
   private nextSequentialIndex = 0;
@@ -164,32 +164,22 @@ export class ChunkstreamEngine {
       }
       this.log(`stsz/stco samples parsed (video): ${videoSamples.length}`);       
 
+      const MAX_SEGMENT_BYTES = 8 * 1024 * 1024; // cap per-segment size for on-demand safety
+
       const trackTimescale = videoTrack.timescale || videoTrackInfo.timescale || info.timescale;
       const totalDuration = info.duration / info.timescale;
-      let { segments, boundaries } = this.buildSegmentsFromSamples(videoSamples, trackTimescale, totalDuration);
+      const estBitrate = videoTrackInfo.bitrate || ((this.file.size * 8) / totalDuration);
+      const targetDuration = Math.min(10, Math.floor((MAX_SEGMENT_BYTES * 8) / estBitrate));
+      this.segmentDuration = targetDuration;
+      let { segments, boundaries } = this.buildSegmentsFromSamples(videoSamples, trackTimescale, totalDuration, this.segmentDuration);
+      
+      
       if (segments.length === 0) {
         throw new Error("No segments were constructed from the sample table.");
       }
       this.segmentSampleBoundaries = boundaries;
 
-      // If any segment is overly large, shrink segmentDuration based on bitrate and rebuild.
-      const MAX_SEGMENT_BYTES = 32 * 1024 * 1024; // cap per-segment size for on-demand safety
-      const maxSegBytes = Math.max(...segments.map(s => s.endByte - s.startByte));
-      if (maxSegBytes > MAX_SEGMENT_BYTES) {
-        const estBitrate = videoTrackInfo.bitrate || ((this.file.size * 8) / totalDuration);
-        if (estBitrate > 0 && Number.isFinite(estBitrate)) {
-          const targetDuration = Math.max(1, Math.floor((MAX_SEGMENT_BYTES * 8) / estBitrate));
-          if (targetDuration < this.segmentDuration) {
-            this.log(`Segment size ${ (maxSegBytes / (1024 * 1024)).toFixed(1) }MB exceeds cap; shrink segmentDuration to ${targetDuration}s.`);
-            this.segmentDuration = targetDuration;
-            const rebuilt = this.buildSegmentsFromSamples(videoSamples, trackTimescale, totalDuration, this.segmentDuration);
-            segments = rebuilt.segments;
-            boundaries = rebuilt.boundaries;
-            this.segmentSampleBoundaries = boundaries;
-          }
-        }
-      }
-
+      
       // Build corresponding audio segment boundaries aligned to video segment end times
       const audioTrackInfo = info.audioTracks?.[0];
       if (audioTrackInfo) {
@@ -474,6 +464,12 @@ export class ChunkstreamEngine {
       }
     }
     this.cleanupPrioritySocket();
+    // Full completion: free caches to reduce memory.
+    if (this.stopRequested || this.fragmentGenerationDone) {
+      this.segmentFragments.clear();
+      this.audioSegmentFragments.clear();
+      this.drainWaitersAfterComplete();
+    }
   }
 
   private connectPrioritySocket() {
@@ -503,7 +499,31 @@ export class ChunkstreamEngine {
           // New priority set replaces the old queue for faster response to latest seek
           this.priorityQueue = [];
           this.priorityQueueSet.clear();
-          data.indexes.forEach((idx: number) => this.enqueuePriorityTask(idx));
+          const PREFETCH_BACK = 6; // Dash会向前多要几段，提前铺开避免 404
+          const PREFETCH_FORWARD = 2;
+          const indexes = data.indexes
+            .map((idx: number) => Number.isInteger(idx) ? idx : -1)
+            .filter((idx: number) => idx >= 0 && idx < this.segments.length);
+          const extras: number[] = [];
+          if (indexes.length > 0) {
+            const minIdx = Math.min(...indexes);
+            const maxIdx = Math.max(...indexes);
+            for (let i = Math.max(0, minIdx - PREFETCH_BACK); i < minIdx; i++) {
+              extras.push(i);
+            }
+            for (let i = maxIdx + 1; i <= Math.min(this.segments.length - 1, maxIdx + PREFETCH_FORWARD); i++) {
+              extras.push(i);
+            }
+          }
+          const all = [...indexes, ...extras];
+          all.sort((a, b) => a - b);
+          const unique = Array.from(new Set(all));
+          indexes.forEach((idx: number) => this.enqueuePriorityTask(idx));
+          unique.forEach((idx: number) => this.enqueuePriorityTask(idx));
+          if (unique.length > 0) {
+            // Move sequential pointer close to the seek target to avoid re-uploading from the head.
+            this.nextSequentialIndex = Math.min(...unique);
+          }
         }
       } catch (err) {
         console.warn("Failed to parse priority WS message", err);
@@ -556,12 +576,15 @@ export class ChunkstreamEngine {
   private async processTask(index: number) {
     const segment = this.segments.find(s => s.index === index);
     if (!segment) return;
+    if (segment.status === "completed") return;
     const [fragment, audioFragment] = await Promise.all([
       this.waitForVideoFragment(index, 20000),
       this.audioSegmentCount > 0 ? this.waitForAudioFragment(index, 20000) : Promise.resolve(null)
     ]);
     if (!fragment) {
       this.log(`Segment ${index} not ready, will retry`);
+      // Re-queue as priority so we keep focusing on the seek target instead of falling back to head.
+      this.enqueuePriorityTask(index);
       this.updateSegmentStatus(index, 'pending');
       return;
     }
@@ -583,7 +606,11 @@ export class ChunkstreamEngine {
         audioForm.append("index", index.toString());
         await uploaderService.uploadAudioSegment(this.videoId!, index, audioForm);
       } else {
-        this.log(`Audio fragment ${index} not ready; video uploaded without audio.`);
+        // Audio missing: push back into priority queue to retry soon instead of waiting for sequential sweep.
+        this.log(`Audio fragment ${index} not ready; requeueing for retry.`);
+        this.enqueuePriorityTask(index);
+        this.updateSegmentStatus(index, 'pending');
+        return;
       }
     }
     
@@ -653,6 +680,13 @@ export class ChunkstreamEngine {
     }
 
     return new Promise<void>((resolve) => {
+      let completed = false;
+      // Promise 只用来收尾生命周期，真正的数据分发走 notifyFragmentReady/notifyAudioFragmentReady。
+      const finish = () => {
+        if (completed) return;
+        completed = true;
+        resolve();
+      };
       try {
         const mp4boxFile = MP4Box.createFile();
         let videoTrackId: number | null = null;
@@ -660,13 +694,6 @@ export class ChunkstreamEngine {
         let videoReady = false;
         let audioReady = false;
         let audioExpected = false;
-        let completed = false;
-        // Promise 只用来收尾生命周期，真正的数据分发走 notifyFragmentReady/notifyAudioFragmentReady。
-        const finish = () => {
-          if (completed) return;
-          completed = true;
-          resolve();
-        };
 
         mp4boxFile.onError = (e: any) => {
           this.log(`on-demand mp4box error: ${typeof e === "string" ? e : e?.message || "unknown"}`);
@@ -770,15 +797,17 @@ export class ChunkstreamEngine {
         (headerBuf as any).fileStart = 0;
         mp4boxFile.appendBuffer(headerBuf);
 
-        // Use moderate chunks and cap total bytes per run to avoid large ArrayBuffer allocations.
+        // Use moderate chunks; allow extra padding around the target window to cover interleaved audio/video.
         const CHUNK = 512 * 1024;
-        const MAX_BYTES_PER_RUN = 64 * 1024 * 1024;
+        const RANGE_PADDING = 2 * 1024 * 1024;
 
         // Feed a byte range into mp4box (targeted or from start)
         const feedRange = async (start: number, end: number): Promise<boolean> => {
           let offset = start;
-          let fed = 0;
           while (offset < end) {
+            if (this.stopRequested || this.fragmentGenerationDone) {
+              return false;
+            }
             const sliceEnd = Math.min(offset + CHUNK, end);
             try {
               const buf = await this.file.slice(offset, sliceEnd).arrayBuffer();
@@ -788,12 +817,7 @@ export class ChunkstreamEngine {
               this.log(`On-demand feed error reading range [${offset}, ${sliceEnd}): ${err?.message || err}`);
               return false;
             }
-            fed += sliceEnd - offset;
             offset = sliceEnd;
-            if (fed > MAX_BYTES_PER_RUN) {
-              this.log(`On-demand feed aborted: exceeded max bytes per run (${MAX_BYTES_PER_RUN} bytes).`);
-              return false;
-            }
           }
           mp4boxFile.flush();
           return true;
@@ -804,8 +828,10 @@ export class ChunkstreamEngine {
         const run = async () => {
           // For multi-track safety, extend range to cover audio bytes if known
           const audioRange = this.computeAudioByteRange(index);
-          const readStart = Math.max(0, Math.min(seg.startByte, audioRange?.startByte ?? seg.startByte));
-          const readEnd = Math.min(this.file.size, Math.max(seg.endByte, audioRange?.endByte ?? seg.endByte));
+          const baseStart = Math.min(seg.startByte, audioRange?.startByte ?? seg.startByte);
+          const baseEnd = Math.max(seg.endByte, audioRange?.endByte ?? seg.endByte);
+          const readStart = Math.max(0, baseStart - RANGE_PADDING);
+          const readEnd = Math.min(this.file.size, baseEnd + RANGE_PADDING);
 
           const ok = await feedRange(readStart, readEnd);
           if (!ok) {
@@ -816,8 +842,8 @@ export class ChunkstreamEngine {
           if (!fragmentComplete) {
             // Avoid reading the entire file; limit fallback to a sliding window before the target end.
             const FALLBACK_WINDOW = 64 * 1024 * 1024; // 64MB cap to prevent giant ArrayBuffer allocations
-            const fallbackStart = Math.max(0, readEnd - FALLBACK_WINDOW);
-            this.log(`On-demand build for segment ${index} incomplete; retrying with bounded prefix [${fallbackStart}, ${readEnd}).`);
+            const fallbackStart = Math.max(0, readStart - FALLBACK_WINDOW);
+            this.log(`On-demand build for segment ${index} incomplete; retrying with bounded window [${fallbackStart}, ${readEnd}).`);
             const okFallback = await feedRange(fallbackStart, readEnd);
             if (!okFallback) {
               finish();
@@ -825,8 +851,21 @@ export class ChunkstreamEngine {
             }
             fragmentComplete = videoReady && (!audioExpected || audioReady);
             if (!fragmentComplete) {
-              this.log(`On-demand build for segment ${index} failed even with full prefix.`);
-              finish();
+              // Last resort: feed from the start up to readEnd if size is reasonable, to guarantee audio/video interleave coverage.
+              const MAX_PREFIX_BYTES = 512 * 1024 * 1024; // guardrail
+              if (readEnd <= MAX_PREFIX_BYTES) {
+                this.log(`On-demand build for segment ${index} still incomplete; final attempt with prefix [0, ${readEnd}).`);
+                const okPrefix = await feedRange(0, readEnd);
+                if (!okPrefix) {
+                  finish();
+                  return;
+                }
+                fragmentComplete = videoReady && (!audioExpected || audioReady);
+              }
+              if (!fragmentComplete) {
+                this.log(`On-demand build for segment ${index} failed even after full prefix.`);
+                finish();
+              }
             }
           }
           if (fragmentComplete) {
@@ -994,16 +1033,17 @@ export class ChunkstreamEngine {
              this.notifyFragmentReady(segmentIndex, blob);
              this.log(`notify Fragment:${segmentIndex}`);
              segmentIndex += 1;
-             if (videoTrackId !== null) {
-               mp4boxFile.releaseUsedSamples(videoTrackId, sampleNum);
-             }
-             if (isLast || segmentIndex >= segments.length) {
-               this.fragmentGenerationDone = true;
-             }
-           } else if (id === audioTrackId) {
-             this.audioSegmentFragments.set(audioSegmentIndex, blob);
-             this.notifyAudioFragmentReady(audioSegmentIndex, blob);
-             audioSegmentIndex += 1;
+           if (videoTrackId !== null) {
+             mp4boxFile.releaseUsedSamples(videoTrackId, sampleNum);
+           }
+           if (isLast || segmentIndex >= segments.length) {
+             this.fragmentGenerationDone = true;
+             this.drainWaitersAfterComplete();
+           }
+          } else if (id === audioTrackId) {
+            this.audioSegmentFragments.set(audioSegmentIndex, blob);
+            this.notifyAudioFragmentReady(audioSegmentIndex, blob);
+            audioSegmentIndex += 1;
              if (audioTrackId !== null) {
                mp4boxFile.releaseUsedSamples(audioTrackId, sampleNum);
              }
@@ -1034,6 +1074,20 @@ export class ChunkstreamEngine {
     }
   }
 
+  private drainWaitersAfterComplete() {
+    // Resolve any lingering waiters with available fragments (or null) once generation is done.
+    for (const [idx, waiters] of this.fragmentWaiters.entries()) {
+      const blob = this.segmentFragments.get(idx) || null;
+      waiters.forEach(res => res(blob));
+    }
+    for (const [idx, waiters] of this.audioFragmentWaiters.entries()) {
+      const blob = this.audioSegmentFragments.get(idx) || null;
+      waiters.forEach(res => res(blob));
+    }
+    this.fragmentWaiters.clear();
+    this.audioFragmentWaiters.clear();
+  }
+
   private computeAudioByteRange(index: number): { startByte: number; endByte: number } | null {
     if (this.audioSegmentBoundaries.length === 0 || this.audioSamples.length === 0) return null;
     if (index < 0 || index >= this.audioSegmentBoundaries.length) return null;
@@ -1049,6 +1103,11 @@ export class ChunkstreamEngine {
   }
 
   private ensureOnDemandGeneration(index: number) {
+    // Once streaming fragmenter finished or segment already completed, skip on-demand to avoid needless work.
+    if (this.fragmentGenerationDone) return;
+    const seg = this.segments[index];
+    if (!seg || seg.status === "completed") return;
+    if (this.stopRequested) return;
     if (this.onDemandGeneration.has(index)) return;
     const genPromise = this.buildFragmentOnDemand(index)
       .catch(err => {
@@ -1063,6 +1122,11 @@ export class ChunkstreamEngine {
   private waitForVideoFragment(index: number, timeoutMs = 15000): Promise<Blob | null> {
     const existing = this.segmentFragments.get(index);
     if (existing) return Promise.resolve(existing);
+    const seg = this.segments.find(s => s.index === index);
+    if (seg?.status === "completed" || this.fragmentGenerationDone || this.stopRequested) {
+      // Already uploaded and purged; nothing to wait for.
+      return Promise.resolve(null);
+    }
 
     // Kick off on-demand generation if not already running and fragment not yet produced.
     this.ensureOnDemandGeneration(index);
@@ -1072,6 +1136,12 @@ export class ChunkstreamEngine {
       waiters.push(resolve);
       this.fragmentWaiters.set(index, waiters);
       setTimeout(() => {
+        // If done/aborted in the meantime, skip noisy logging.
+        const curSeg = this.segments.find(s => s.index === index);
+        if (this.fragmentGenerationDone || this.stopRequested || curSeg?.status === "completed") {
+          resolve(null);
+          return;
+        }
         const late = this.segmentFragments.get(index);
         if (late) {
           resolve(late);
@@ -1086,6 +1156,11 @@ export class ChunkstreamEngine {
   private waitForAudioFragment(index: number, timeoutMs = 15000): Promise<Blob | null> {
     const existing = this.audioSegmentFragments.get(index);
     if (existing) return Promise.resolve(existing);
+    const seg = this.segments.find(s => s.index === index);
+    if (seg?.status === "completed" || this.fragmentGenerationDone || this.stopRequested) {
+      // Already uploaded and purged; nothing to wait for.
+      return Promise.resolve(null);
+    }
 
     // Trigger on-demand generation if audio missing too.
     this.ensureOnDemandGeneration(index);
@@ -1095,6 +1170,11 @@ export class ChunkstreamEngine {
       waiters.push(resolve);
       this.audioFragmentWaiters.set(index, waiters);
       setTimeout(() => {
+        const curSeg = this.segments.find(s => s.index === index);
+        if (this.fragmentGenerationDone || this.stopRequested || curSeg?.status === "completed") {
+          resolve(null);
+          return;
+        }
         const late = this.audioSegmentFragments.get(index);
         if (late) resolve(late);
         else resolve(null);
