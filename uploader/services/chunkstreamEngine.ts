@@ -16,8 +16,8 @@ export class ChunkstreamEngine {
   private audioInitFragment: Blob | null = null;
   private segmentFragments: Map<number, Blob> = new Map();
   private audioSegmentFragments: Map<number, Blob> = new Map();
-  private fragmentWaiters: Map<number, ((blob: Blob) => void)[]> = new Map();
-  private audioFragmentWaiters: Map<number, ((blob: Blob) => void)[]> = new Map();
+  private fragmentWaiters: Map<number, ((blob: Blob | null) => void)[]> = new Map();
+  private audioFragmentWaiters: Map<number, ((blob: Blob | null) => void)[]> = new Map();
   private onDemandGeneration: Map<number, Promise<void>> = new Map();
   private priorityQueue: number[] = [];
   private priorityQueueSet: Set<number> = new Set();
@@ -578,8 +578,10 @@ export class ChunkstreamEngine {
     if (!segment) return;
     if (segment.status === "completed") return;
     const [fragment, audioFragment] = await Promise.all([
-      this.waitForVideoFragment(index, 20000),
-      this.audioSegmentCount > 0 ? this.waitForAudioFragment(index, 20000) : Promise.resolve(null)
+      this.waitForFragment(index, 20000, this.segmentFragments, this.fragmentWaiters, "video", true),
+      this.audioSegmentCount > 0
+        ? this.waitForFragment(index, 20000, this.audioSegmentFragments, this.audioFragmentWaiters, "audio")
+        : Promise.resolve(null)
     ]);
     if (!fragment) {
       this.log(`Segment ${index} not ready, will retry`);
@@ -1119,8 +1121,15 @@ export class ChunkstreamEngine {
     this.onDemandGeneration.set(index, genPromise);
   }
 
-  private waitForVideoFragment(index: number, timeoutMs = 15000): Promise<Blob | null> {
-    const existing = this.segmentFragments.get(index);
+  private waitForFragment(
+    index: number,
+    timeoutMs: number,
+    fragments: Map<number, Blob>,
+    waiters: Map<number, ((blob: Blob | null) => void)[]>,
+    label: "video" | "audio",
+    logTimeout = false
+  ): Promise<Blob | null> {
+    const existing = fragments.get(index);
     if (existing) return Promise.resolve(existing);
     const seg = this.segments.find(s => s.index === index);
     if (seg?.status === "completed" || this.fragmentGenerationDone || this.stopRequested) {
@@ -1132,9 +1141,9 @@ export class ChunkstreamEngine {
     this.ensureOnDemandGeneration(index);
 
     return new Promise(resolve => {
-      const waiters = this.fragmentWaiters.get(index) || [];
-      waiters.push(resolve);
-      this.fragmentWaiters.set(index, waiters);
+      const waiterList = waiters.get(index) || [];
+      waiterList.push(resolve);
+      waiters.set(index, waiterList);
       setTimeout(() => {
         // If done/aborted in the meantime, skip noisy logging.
         const curSeg = this.segments.find(s => s.index === index);
@@ -1142,42 +1151,13 @@ export class ChunkstreamEngine {
           resolve(null);
           return;
         }
-        const late = this.segmentFragments.get(index);
+        const late = fragments.get(index);
         if (late) {
           resolve(late);
         } else {
-          this.log(`Timeout waiting for fragment ${index}`);
+          if (logTimeout) this.log(`Timeout waiting for ${label} fragment ${index}`);
           resolve(null);
         }
-      }, timeoutMs);
-    });
-  }
-
-  private waitForAudioFragment(index: number, timeoutMs = 15000): Promise<Blob | null> {
-    const existing = this.audioSegmentFragments.get(index);
-    if (existing) return Promise.resolve(existing);
-    const seg = this.segments.find(s => s.index === index);
-    if (seg?.status === "completed" || this.fragmentGenerationDone || this.stopRequested) {
-      // Already uploaded and purged; nothing to wait for.
-      return Promise.resolve(null);
-    }
-
-    // Trigger on-demand generation if audio missing too.
-    this.ensureOnDemandGeneration(index);
-
-    return new Promise(resolve => {
-      const waiters = this.audioFragmentWaiters.get(index) || [];
-      waiters.push(resolve);
-      this.audioFragmentWaiters.set(index, waiters);
-      setTimeout(() => {
-        const curSeg = this.segments.find(s => s.index === index);
-        if (this.fragmentGenerationDone || this.stopRequested || curSeg?.status === "completed") {
-          resolve(null);
-          return;
-        }
-        const late = this.audioSegmentFragments.get(index);
-        if (late) resolve(late);
-        else resolve(null);
       }, timeoutMs);
     });
   }
