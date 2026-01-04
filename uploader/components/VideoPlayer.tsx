@@ -68,6 +68,20 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ manifestUrl, videoId }
   useEffect(() => {
     if (manifestUrl && videoRef.current && !playerRef.current) {
       const player = dashjs.MediaPlayer().create();
+      player.updateSettings({
+        streaming: {
+          // Keep seek fetches lightweight to improve scrub responsiveness.
+          buffer: {
+            bufferToKeep: 0, // seconds of back-buffer to retain
+            stableBufferTime: 4,
+            bufferTimeAtTopQuality: 4
+          },
+          scheduling: {
+            scheduleWhilePaused: false
+          },
+          fastSwitchEnabled: true
+        }
+      });
       player.initialize(videoRef.current, manifestUrl, true);
 
       const sendPrioritize = (index: number) => {

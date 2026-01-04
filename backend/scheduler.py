@@ -10,8 +10,8 @@ from collections import defaultdict
 @dataclass
 class SegmentMeta:
     index: int
-    base_priority: int = 10        # 顺序上传的基础优先级
-    hot_count: int = 0             # 热度计数：每次有人看/seek 附近就 +1
+    base_priority: int = 10        # 
+    hot_count: int = 0             # increase 1 for every seek 
     state: str = "PENDING"         # PENDING / ASSIGNED / UPLOADED
     assigned_to: Optional[str] = None
     start_time: Optional[float] = None
@@ -20,8 +20,8 @@ class SegmentMeta:
     @property
     def effective_priority(self) -> int:
         """
-        实际用于排序的优先级：数字越小优先级越高。
-        多人观看 -> hot_count 增加 -> effective_priority 变小。
+        Priority used for sorting: smaller numbers mean higher priority. 
+        More viewers → hot_count rises → effective_priority goes down.
         """
         eff = self.base_priority - self.hot_count
         return eff if eff > 0 else 0
@@ -161,7 +161,7 @@ class UploadScheduler:
         async with lock:
             vs = self._get_video(video_id)
             if vs.segment_count is None:
-                # 还不知道有哪些片段可上传
+                
                 return []
 
             candidates: List[SegmentMeta] = []
@@ -174,7 +174,7 @@ class UploadScheduler:
                     continue
                 candidates.append(seg)
 
-            # 按“实际优先级 + index”排序
+            
             candidates.sort(key=lambda s: (s.effective_priority, s.index))
 
             selected: List[SegmentMeta] = []
@@ -189,9 +189,9 @@ class UploadScheduler:
 
     async def register_uploader(self, video_id: str, uploader_id: str, max_concurrency: int):
         """
-        注册一个上传客户端。
+        register an uploader。
         """
-        # 确保 video 已注册
+        # to ensure video is registered
         await self.register_video(video_id)
         self.uploaders[uploader_id] = {
             "video_id": video_id,
@@ -200,7 +200,7 @@ class UploadScheduler:
 
     async def all_uploaded(self, video_id: str) -> bool:
         """
-        判断某个视频是否所有片段都已 UPLOADED。
+        if every segment  UPLOADED。
         """
         lock = self._locks[video_id]
         async with lock:
