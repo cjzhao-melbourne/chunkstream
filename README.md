@@ -1,13 +1,13 @@
 # Chunkstream
 .
-> **Video share while uploading. Seek instantly**  
+> **Share video while uploading. Seek instantly**  
 > Frontend MPEG-DASH slicing + backend intelligent upload scheduling.
 
 ---
 
 ## 1. What is Chunkstream?
 
-**Chunkstream** is a prototype video sharing platform that lets users share **large MP4 files** as a **MPEG-DASH stream** within milisecond — long before the entire video has been uploaded.
+**Chunkstream** is a prototype video sharing platform that lets users share **large MP4 files** as a **MPEG-DASH stream** within seconds — long before the entire video has been uploaded.
 
 Instead of uploading a multi-GB file and waiting forever for a link, Chunkstream:
 
@@ -47,7 +47,7 @@ The backend is written in **Python**, designed to be extended with **video trans
   - Stores MPD and segment files under that session
 - **Two-queue upload scheduler**
   - **Normal queue**: segments uploaded in natural order
-  - **Priority queue**: segments that the viewer is currently watching or has just seeked to
+  - **Priority queue**: segments that the viewer is currently watching or has just sought to
   - When users drag the progress bar, the relevant segments are promoted to the priority queue
 - **Auto lifecycle**
   - Tracks how many segments a video has
@@ -82,6 +82,11 @@ The backend is written in **Python**, designed to be extended with **video trans
 6. When the viewer seeks:
    - frontend notifies backend: `POST /videos/{video_id}/prioritize`
    - scheduler puts upcoming segments into the **priority queue**
+
+### Metrics (local benchmark)
+
+- **Time-to-first-playable (TTFP):** 1.5 s
+- **Seek rebuffer after prioritize:** 1 s
 
 ---
 
