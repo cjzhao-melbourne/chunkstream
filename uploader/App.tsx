@@ -12,8 +12,13 @@ const App: React.FC = () => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [manifestUrl, setManifestUrl] = useState<string | null>(null);
   const [videoId, setVideoId] = useState<string | null>(null);
+  const [startTimestamp, setStartTimestamp] = useState<number | null>(null);
+  const [firstFrameLatencyMs, setFirstFrameLatencyMs] = useState<number | null>(null);
+  const [seekLatencyMs, setSeekLatencyMs] = useState<number | null>(null);
+  const [lastSeekLabel, setLastSeekLabel] = useState<string | null>(null);
   const engineRef = useRef<ChunkstreamEngine | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const addLog = (msg: string) => {
     setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
@@ -39,6 +44,10 @@ const App: React.FC = () => {
     if (!file) return;
     setIsProcessing(true);
     setLogs([]);
+    setFirstFrameLatencyMs(null);
+    setSeekLatencyMs(null);
+    setLastSeekLabel(null);
+    setStartTimestamp(performance.now());
 
     const engine = new ChunkstreamEngine(file, {
       segmentDuration: 10,
@@ -75,6 +84,9 @@ const App: React.FC = () => {
   const handleClosePlayback = () => {
     setManifestUrl(null);
     setVideoId(null);
+    setFirstFrameLatencyMs(null);
+    setSeekLatencyMs(null);
+    setLastSeekLabel(null);
     addLog("Preview closed by user.");
   };
 
@@ -121,18 +133,26 @@ const App: React.FC = () => {
               
               <div className="space-y-4">
                 <input
+                  ref={fileInputRef}
                   type="file"
                   accept="video/mp4"
                   onChange={handleFileChange}
                   disabled={isProcessing}
-                  className="block w-full text-sm text-slate-400
-                    file:mr-4 file:py-2 file:px-4
-                    file:rounded-full file:border-0
-                    file:text-sm file:font-semibold
-                    file:bg-indigo-900/50 file:text-indigo-300
-                    hover:file:bg-indigo-900/70
-                    cursor-pointer"
+                  className="hidden"
                 />
+
+                <div className="flex items-center gap-3">
+                  <Button
+                    variant="secondary"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isProcessing}
+                  >
+                    Select File
+                  </Button>
+                  <span className="text-sm text-slate-400 truncate">
+                    {file ? file.name : "No file chosen"}
+                  </span>
+                </div>
                 
                 <div className="flex gap-3">
                   <Button 
@@ -161,7 +181,7 @@ const App: React.FC = () => {
             )}
           </div>
 
-          {/* Right: Player */}
+          {/* Right: Player with latency overlay */}
           <div className="space-y-6">
              <div className="bg-slate-800/50 p-6 rounded-xl border border-slate-700 h-full flex flex-col">
                 <div className="flex items-center justify-between mb-4 gap-3">
@@ -182,13 +202,39 @@ const App: React.FC = () => {
                       onClick={handleClosePlayback}
                       disabled={!manifestUrl}
                     >
-                      Close
+                      Reset
                     </Button>
                   </div>
                 </div>
                 {manifestUrl ? (
                   <div className="flex-1 flex flex-col justify-center">
-                    <VideoPlayer manifestUrl={manifestUrl} videoId={videoId} />
+                    <VideoPlayer 
+                      manifestUrl={manifestUrl} 
+                      videoId={videoId} 
+                      startTimestamp={startTimestamp}
+                      onFirstFrame={(ms) => setFirstFrameLatencyMs(ms)}
+                      onSeekLatency={(ms) => {
+                        setSeekLatencyMs(ms);
+                        setLastSeekLabel(new Date().toLocaleTimeString());
+                      }}
+                    />
+                    <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div className="p-3 rounded-lg border border-slate-700 bg-slate-900/60 text-center">
+                        <p className="text-xs text-slate-400 mb-1">First Frame Latency</p>
+                        <p className="text-lg font-bold text-indigo-300">
+                          {firstFrameLatencyMs != null ? `${(firstFrameLatencyMs / 1000).toFixed(2)}s` : "--"}
+                        </p>
+                      </div>
+                      <div className="p-3 rounded-lg border border-slate-700 bg-slate-900/60 text-center">
+                        <p className="text-xs text-slate-400 mb-1">Seek Playback Latency</p>
+                        <p className="text-lg font-bold text-emerald-300">
+                          {seekLatencyMs != null ? `${(seekLatencyMs / 1000).toFixed(2)}s` : "--"}
+                        </p>
+                        <p className="text-[10px] text-slate-500">
+                          {lastSeekLabel ? `Last seek @ ${lastSeekLabel}` : ""}
+                        </p>
+                      </div>
+                    </div>
                     <p className="text-xs text-center mt-2 text-slate-500 break-all">
                       {manifestUrl}
                     </p>

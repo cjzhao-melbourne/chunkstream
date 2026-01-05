@@ -14,9 +14,9 @@ export class ChunkstreamEngine {
   private headerBuffer: MP4BoxBuffer | null = null;
   private videoInitFragment: Blob | null = null;
   private audioInitFragment: Blob | null = null;
-  private segmentFragments: Map<number, Blob> = new Map();
+  private videoSegmentFragments: Map<number, Blob> = new Map();
   private audioSegmentFragments: Map<number, Blob> = new Map();
-  private fragmentWaiters: Map<number, ((blob: Blob | null) => void)[]> = new Map();
+  private videoFragmentWaiters: Map<number, ((blob: Blob | null) => void)[]> = new Map();
   private audioFragmentWaiters: Map<number, ((blob: Blob | null) => void)[]> = new Map();
   private onDemandGeneration: Map<number, Promise<void>> = new Map();
   private priorityQueue: number[] = [];
@@ -28,7 +28,7 @@ export class ChunkstreamEngine {
   private fragmentGenerationDone = false;
   private audioSegmentCount = 0;
   private segments: SegmentInfo[] = [];
-  private segmentSampleBoundaries: number[] = [];
+  private videoSegmentBoundaries: number[] = [];
   private audioSegmentBoundaries: number[] = [];
   private audioSamples: MP4BoxSample[] = [];
   private inFlight = new Set<number>();
@@ -61,9 +61,9 @@ export class ChunkstreamEngine {
       this.log("Starting MOOV parse and streaming fragmentation...");
 
       // 1) Fast MOOV parse and virtual segments (no full read)
-      const t0 = performance.now();
+      const tStart = performance.now();
       const { info, segments, headerBuffer } = await this.parseMoovAndVirtualize();
-      this.log(`loadMoovOnly: ${(performance.now() - t0).toFixed(1)}ms`);
+      
       this.mp4Info = info;
       this.totalDurationSec = info.duration / info.timescale;
       this.segments = segments;
@@ -128,6 +128,7 @@ export class ChunkstreamEngine {
       // 7) Notify player after first segment uploaded (or timeout)
       await this.waitForSegmentCompletion(0, 20000);
       this.onReadyToPlay(playerService.getManifestUrl(this.videoId), this.videoId);
+      this.log(`ReadytoPlay: ${(performance.now() - tStart).toFixed(1)}ms`);
 
     } catch (err: any) {
       this.log(`Error: ${err.message}`);
@@ -149,13 +150,15 @@ export class ChunkstreamEngine {
     if (!MP4Box || typeof MP4Box.loadMoovOnly !== "function") {
       return Promise.reject(new Error("MP4Box.loadMoovOnly not available"));
     }
+    const t0 = performance.now();
 
     return MP4Box.loadMoovOnly({
       blob: this.file,
       // Let MP4Box know the total size so it keeps fetching beyond the first chunk if needed
       size: this.file.size,
     }).then(({ info, mp4, header }: { info: MP4BoxInfo; mp4: MP4File; header?: MP4BoxBuffer }) => {
-      this.log("MOOV atom parsed. Building virtual segments from stsz/stco...");
+      this.log(`loadMoovOnly: ${(performance.now() - t0).toFixed(1)}ms`);
+      //this.log("MOOV atom parsed. Building virtual segments from stsz/stco...");
       
 
       const videoTrackInfo = info.videoTracks[0];
@@ -182,7 +185,7 @@ export class ChunkstreamEngine {
       if (segments.length === 0) {
         throw new Error("No segments were constructed from the sample table.");
       }
-      this.segmentSampleBoundaries = boundaries;
+      this.videoSegmentBoundaries = boundaries;
 
       
       // Build corresponding audio segment boundaries aligned to video segment end times
@@ -471,7 +474,7 @@ export class ChunkstreamEngine {
     this.cleanupPrioritySocket();
     // Full completion: free caches to reduce memory.
     if (this.stopRequested || this.fragmentGenerationDone) {
-      this.segmentFragments.clear();
+      this.videoSegmentFragments.clear();
       this.audioSegmentFragments.clear();
       this.drainWaitersAfterComplete();
     }
@@ -504,7 +507,7 @@ export class ChunkstreamEngine {
           // New priority set replaces the old queue for faster response to latest seek
           this.priorityQueue = [];
           this.priorityQueueSet.clear();
-          const PREFETCH_BACK = 6; // Dash会向前多要几段，提前铺开避免 404
+          const PREFETCH_BACK = 0; 
           const PREFETCH_FORWARD = 2;
           const indexes = data.indexes
             .map((idx: number) => Number.isInteger(idx) ? idx : -1)
@@ -583,7 +586,7 @@ export class ChunkstreamEngine {
     if (!segment) return;
     if (segment.status === "completed") return;
     const [fragment, audioFragment] = await Promise.all([
-      this.waitForFragment(index, 20000, this.segmentFragments, this.fragmentWaiters, "video", true),
+      this.waitForFragment(index, 20000, this.videoSegmentFragments, this.videoFragmentWaiters, "video", true),
       this.audioSegmentCount > 0
         ? this.waitForFragment(index, 20000, this.audioSegmentFragments, this.audioFragmentWaiters, "audio")
         : Promise.resolve(null)
@@ -625,7 +628,7 @@ export class ChunkstreamEngine {
     this.log(`Segment ${index} uploaded.`);
 
     // Free memory after upload
-    this.segmentFragments.delete(index);
+    this.videoSegmentFragments.delete(index);
     if (this.audioSegmentCount > 0) {
       this.audioSegmentFragments.delete(index);
     }
@@ -733,9 +736,9 @@ export class ChunkstreamEngine {
            this.videoTrackId = videoTrack.id;
            const audioTrack = info.audioTracks?.[0];
            this.audioTrackId = audioTrack ? audioTrack.id : null;
-           if (typeof mp4boxFile.setExternalSegmentBoundaries === "function" && this.segmentSampleBoundaries.length > 0) {
-           mp4boxFile.setExternalSegmentBoundaries(this.videoTrackId, { mode: "stream", track: "video" }, this.segmentSampleBoundaries, { rapAlignement: true });
-           this.log(`Segmenter using external boundaries count=${this.segmentSampleBoundaries.length}`);
+           if (typeof mp4boxFile.setExternalSegmentBoundaries === "function" && this.videoSegmentBoundaries.length > 0) {
+           mp4boxFile.setExternalSegmentBoundaries(this.videoTrackId, { mode: "stream", track: "video" }, this.videoSegmentBoundaries, { rapAlignement: true });
+           this.log(`Segmenter using external boundaries count=${this.videoSegmentBoundaries.length}`);
            } else {
            const desiredFragments = Math.max(1, this.segments.length);
            const totalSamples = videoTrack.nb_samples || desiredFragments;
@@ -829,15 +832,14 @@ export class ChunkstreamEngine {
            const isAudio = id === this.audioTrackId;
            if (!isVideo && !isAudio) return;
            let targetIndex = -1;
-           if (isVideo && user?.mode === "stream") {
+           const boundaryIndex = isVideo
+             ? this.findVideoSegmentIndex(sampleNum)
+             : this.findAudioSegmentIndex(sampleNum);
+           const isStreamFlow = isVideo && user?.mode === "stream";
+           if (isStreamFlow) {
              targetIndex = this.streamingVideoSegmentsEmitted;
-           } else {
-             const boundaryIndex = isVideo
-               ? this.findVideoSegmentIndex(sampleNum)
-               : this.findAudioSegmentIndex(sampleNum);
-             if (boundaryIndex >= 0) {
-               targetIndex = boundaryIndex;
-             }
+           } else if (boundaryIndex >= 0) {
+             targetIndex = boundaryIndex;
            }
            if (targetIndex < 0) {
              if (isVideo && this.videoTrackId !== null) {
@@ -848,12 +850,21 @@ export class ChunkstreamEngine {
              }
              return;
            }
-           const blob = new Blob([buffer], { type: isVideo ? "video/iso.segment" : "audio/mp4" });
+           if (targetIndex >= this.segments.length) {
+             if (isVideo && this.videoTrackId !== null) {
+               mp4boxFile.releaseUsedSamples(this.videoTrackId, sampleNum);
+             }
+             if (isAudio && this.audioTrackId !== null) {
+               mp4boxFile.releaseUsedSamples(this.audioTrackId, sampleNum);
+             }
+             return;
+           }
+          const blob = new Blob([buffer], { type: isVideo ? "video/iso.segment" : "audio/mp4" });
           if (isVideo) {
-            const fresh = !this.segmentFragments.has(targetIndex);
-            this.segmentFragments.set(targetIndex, blob);
+            const fresh = !this.videoSegmentFragments.has(targetIndex);
+            this.videoSegmentFragments.set(targetIndex, blob);
             if (fresh) {
-               if (user?.mode === "stream") {
+               if (isStreamFlow) {
                  this.streamingVideoSegmentsEmitted += 1;
                }
                this.notifyFragmentReady(targetIndex, blob);
@@ -894,10 +905,10 @@ export class ChunkstreamEngine {
   }
 
   private notifyFragmentReady(index: number, blob: Blob) {
-    const waiters = this.fragmentWaiters.get(index);
+    const waiters = this.videoFragmentWaiters.get(index);
     if (waiters) {
       waiters.forEach(res => res(blob));
-      this.fragmentWaiters.delete(index);
+      this.videoFragmentWaiters.delete(index);
     }
   }
 
@@ -911,15 +922,15 @@ export class ChunkstreamEngine {
 
   private drainWaitersAfterComplete() {
     // Resolve any lingering waiters with available fragments (or null) once generation is done.
-    for (const [idx, waiters] of this.fragmentWaiters.entries()) {
-      const blob = this.segmentFragments.get(idx) || null;
+    for (const [idx, waiters] of this.videoFragmentWaiters.entries()) {
+      const blob = this.videoSegmentFragments.get(idx) || null;
       waiters.forEach(res => res(blob));
     }
     for (const [idx, waiters] of this.audioFragmentWaiters.entries()) {
       const blob = this.audioSegmentFragments.get(idx) || null;
       waiters.forEach(res => res(blob));
     }
-    this.fragmentWaiters.clear();
+    this.videoFragmentWaiters.clear();
     this.audioFragmentWaiters.clear();
   }
 
@@ -982,7 +993,7 @@ export class ChunkstreamEngine {
   }
 
   private findVideoSegmentIndex(sampleNum: number): number {
-    return this.segmentSampleBoundaries.findIndex(boundary => sampleNum <= boundary);
+    return this.videoSegmentBoundaries.findIndex(boundary => sampleNum <= boundary);
   }
 
   private findAudioSegmentIndex(sampleNum: number): number {

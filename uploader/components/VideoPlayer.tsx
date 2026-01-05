@@ -6,14 +6,25 @@ declare const dashjs: any;
 interface VideoPlayerProps {
   manifestUrl: string | null;
   videoId: string | null;
+  startTimestamp?: number | null;
+  onFirstFrame?: (ms: number) => void;
+  onSeekLatency?: (ms: number) => void;
 }
 
-export const VideoPlayer: React.FC<VideoPlayerProps> = ({ manifestUrl, videoId }) => {
+export const VideoPlayer: React.FC<VideoPlayerProps> = ({
+  manifestUrl,
+  videoId,
+  startTimestamp,
+  onFirstFrame,
+  onSeekLatency
+}) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const playerRef = useRef<any>(null);
   const lastReportedIndexRef = useRef<number | null>(null);
   const pendingSeekIndexRef = useRef<number | null>(null);
   const [segmentBoundaries, setSegmentBoundaries] = useState<number[]>([]);
+  const firstFrameReportedRef = useRef(false);
+  const seekStartRef = useRef<number | null>(null);
 
   // Fetch and parse MPD once to build precise segment boundaries from SegmentTimeline
   useEffect(() => {
@@ -98,6 +109,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ manifestUrl, videoId }
         console.log(`Dash seeking -> ${seekTime}s -> segment ${estimatedIndex}`);
         // Fire early to give backend a head start
         sendPrioritize(estimatedIndex);
+        seekStartRef.current = performance.now();
       });
 
       // Only fire prioritize when seek completes (user released the scrubber)
@@ -117,8 +129,49 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ manifestUrl, videoId }
         playerRef.current = null;
       }
       pendingSeekIndexRef.current = null;
+      firstFrameReportedRef.current = false;
+      seekStartRef.current = null;
     };
   }, [manifestUrl, videoId]);
+
+  useEffect(() => {
+    firstFrameReportedRef.current = false;
+  }, [manifestUrl, startTimestamp]);
+
+  useEffect(() => {
+    const videoEl = videoRef.current;
+    if (!videoEl) return;
+    const handlePlaying = () => {
+      const now = performance.now();
+      if (!firstFrameReportedRef.current) {
+        if (typeof startTimestamp === "number") {
+          const latency = now - startTimestamp;
+          onFirstFrame?.(latency);
+        }
+        firstFrameReportedRef.current = true;
+      }
+      // Capture seek latency on every resume after a seek.
+      if (seekStartRef.current) {
+        onSeekLatency?.(now - seekStartRef.current);
+        seekStartRef.current = null;
+      }
+    };
+    videoEl.addEventListener("playing", handlePlaying);
+    return () => {
+      videoEl.removeEventListener("playing", handlePlaying);
+    };
+  }, [startTimestamp, onFirstFrame]);
+
+  // Fallback: if dashjs event misses, track native seeking to start timer.
+  useEffect(() => {
+    const videoEl = videoRef.current;
+    if (!videoEl) return;
+    const handleSeeking = () => {
+      seekStartRef.current = performance.now();
+    };
+    videoEl.addEventListener("seeking", handleSeeking);
+    return () => videoEl.removeEventListener("seeking", handleSeeking);
+  }, []);
 
   if (!manifestUrl) return null;
 

@@ -37,20 +37,20 @@ class VideoState:
 
 class UploadScheduler:
     """
-    负责：
-    - 维护每个 video 的所有片段的状态、优先级、热度
-    - 根据 need_slots 和 already_uploading 选择“下一批应上传的片段”
-    - 根据 viewer 报告的 index 提升对应片段附近的热度
-    - 用 per-video asyncio.Lock 做并发保护
+    Responsibilities:
+    - Track status/priority/heat for every segment of each video
+    - Pick the next batch of segments to upload based on need_slots and already_uploading
+    - Raise the heat near an index reported by viewers
+    - Protect per-video operations with asyncio.Lock
     """
 
     def __init__(self):
         self.videos: Dict[str, VideoState] = {}
         self.uploaders: Dict[str, Dict] = {}
-        # 每个 video_id 一个锁
+        # One lock per video_id
         self._locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
-    # --------- 内部工具函数（同步，只在已加锁的上下文中调用） ---------
+    # --------- Internal helpers (sync, only within locked contexts) ---------
 
     def _get_video(self, video_id: str) -> VideoState:
         vs = self.videos.get(video_id)
@@ -66,7 +66,7 @@ class UploadScheduler:
             vs.segments[index] = SegmentMeta(index=index)
         return vs.segments[index]
 
-    # ------------------- 对外异步 API -------------------
+    # ------------------- Public async API -------------------
 
     async def register_video(
         self,
@@ -75,9 +75,9 @@ class UploadScheduler:
         segment_duration: Optional[float] = None,
     ) -> VideoState:
         """
-        注册/更新一个视频的信息：
-        - segment_count: 已知的片段数量（可选）
-        - segment_duration: 片长（可选）
+        Register/update a video's info:
+        - segment_count: known number of segments (optional)
+        - segment_duration: duration per segment (optional)
         """
         lock = self._locks[video_id]
         async with lock:
@@ -90,7 +90,7 @@ class UploadScheduler:
                 old = vs.segment_count or 0
                 vs.segment_count = max(old, segment_count)
 
-            # 如果已经知道 segment_count，就预先创建 meta
+            # If segment_count is known, pre-create metadata
             if vs.segment_count is not None:
                 for i in range(vs.segment_count):
                     if i not in vs.segments:
@@ -100,7 +100,7 @@ class UploadScheduler:
 
     async def mark_uploaded(self, video_id: str, index: int):
         """
-        某片段上传完成。
+        Mark a segment as uploaded.
         """
         lock = self._locks[video_id]
         async with lock:
@@ -117,15 +117,15 @@ class UploadScheduler:
         window_after: int = 5,
     ):
         """
-        viewer 播放/seek 到 index 时调用：
-        - 给 index 前后一定范围内的片段 hot_count += 1
-        - 多用户多次访问会不断叠加
+        Called when a viewer plays/seeks to index:
+        - hot_count += 1 for segments around index
+        - Multiple viewers/requests accumulate
         """
         lock = self._locks[video_id]
         async with lock:
             vs = self._get_video(video_id)
 
-            # 如果还不知道总片段数，至少保证当前 index 有 meta
+            # If total segment count unknown, ensure current index has metadata
             if vs.segment_count is None:
                 seg = self._ensure_segment(vs, index)
                 if seg.state != "UPLOADED":
@@ -148,11 +148,11 @@ class UploadScheduler:
         already_uploading: Set[int],
     ) -> List[SegmentMeta]:
         """
-        上传客户端“拉任务”：
-        - 从尚未 UPLOADED 的片段中选择
-        - 排除 already_uploading
-        - 避免去抢其他 uploader 已经 ASSIGNED 的任务（简单策略）
-        - 按 effective_priority, index 排序
+        Uploader pulls tasks:
+        - Choose from segments not yet UPLOADED
+        - Exclude already_uploading
+        - Avoid stealing tasks ASSIGNED to another uploader (simple strategy)
+        - Sort by effective_priority, index
         """
         if need_slots <= 0:
             return []
