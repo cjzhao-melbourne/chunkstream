@@ -16,6 +16,8 @@ Instead of uploading a multi-GB file and waiting forever for a link, Chunkstream
 3. **Generates a MPEG-DASH manifest (MPD)** that references these segments
 4. **Streams the video as soon as the first few chunks are available**
 
+![Chunkstream solution](chunkstream-solution.png)
+
 On the backend, Chunkstream orchestrates uploads with a **two-queue scheduler** (normal + priority) so that segments near the current playback position are always uploaded and processed first, keeping user-perceived latency low even when the full video is still in flight.
 
 The backend is written in **Python**, designed to be extended with **video transcoding , video analysis and intelligence** later (e.g., content tagging, scene detection, recommendations, etc.).
@@ -111,4 +113,3 @@ chunkstream/
 └── uploader/
     ├── index.html       # Upload + preview UI
     └── app.tsx           # Browser logic: analyze, chunk, upload, play
-
