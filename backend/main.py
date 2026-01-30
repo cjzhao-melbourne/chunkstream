@@ -14,8 +14,10 @@ from collections import defaultdict
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import Counter, Gauge
+from prometheus_fastapi_instrumentator import Instrumentator
 
-from .models import (
+from models import (
     InitUploadRequest,
     InitUploadResponse,
     PriorityRequest,
@@ -25,7 +27,7 @@ from .models import (
     NextTasksResponse,
     TaskInfo,
 )
-from .scheduler import UploadScheduler
+from scheduler import UploadScheduler
 
 # ---------------- Basic Initialization ----------------
 
@@ -50,6 +52,30 @@ videos_meta: Dict[str, Dict[str, Any]] = {}
 # Scheduler instance
 scheduler = UploadScheduler()
 
+# -------- Metrics (Prometheus) --------
+# Exposed at /metrics by Instrumentator below.
+uploads_total = Counter("uploads_total", "Number of uploaded media segments", ["video_id"])
+upload_bytes_total = Counter("upload_bytes_total", "Total uploaded bytes", ["video_id"])
+players_total = Counter("players_total", "Segment fetch requests from players")
+videos_total = Gauge("videos_total", "Number of registered videos")
+storage_bytes_used = Gauge("storage_bytes_used", "Bytes used under storage/")
+
+
+def _compute_storage_bytes() -> int:
+    total = 0
+    for root, _, files in os.walk(BASE_STORAGE):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except FileNotFoundError:
+                continue
+    return total
+
+
+def update_storage_metrics():
+    storage_bytes_used.set(_compute_storage_bytes())
+    videos_total.set(len(videos_meta))
+
 # WebSocket connections keyed by video_id for uploaders
 uploader_ws_clients: Dict[str, Set[WebSocket]] = defaultdict(set)
 
@@ -66,6 +92,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Auto-instrument HTTP metrics and expose /metrics (schema excluded)
+Instrumentator().instrument(app).expose(app, include_in_schema=False)
 
 # Middleware: log request timestamps
 @app.middleware("http")
@@ -255,6 +284,8 @@ async def init_video(req: InitUploadRequest):
         segment_duration=req.segment_duration,
     )
 
+    update_storage_metrics()
+
     return InitUploadResponse(video_id=video_id)
 
 # ---------------- API: Upload/get init segment (init.m4s) ----------------
@@ -268,8 +299,12 @@ async def upload_init_segment(video_id: str, init: UploadFile = File(...)):
     video_dir = videos_meta[video_id]["dir"]
     init_path = os.path.join(video_dir, "init.m4s")
 
+    data = await init.read()
     with open(init_path, "wb") as f:
-        f.write(await init.read())
+        f.write(data)
+
+    upload_bytes_total.labels(video_id=video_id).inc(len(data))
+    update_storage_metrics()
 
     return {"status": "ok"}
 
@@ -307,8 +342,12 @@ async def upload_audio_init_segment(video_id: str, init: UploadFile = File(...))
     video_dir = videos_meta[video_id]["dir"]
     init_path = os.path.join(video_dir, "audio_init.m4s")
 
+    data = await init.read()
     with open(init_path, "wb") as f:
-        f.write(await init.read())
+        f.write(data)
+
+    upload_bytes_total.labels(video_id=video_id).inc(len(data))
+    update_storage_metrics()
 
     return {"status": "ok"}
 
@@ -353,8 +392,12 @@ async def _save_segment(video_id: str, index: int, segment: UploadFile):
     seg_path = os.path.join(video_dir, seg_filename)
 
     # Save the segment file
+    data = await segment.read()
     with open(seg_path, "wb") as f:
-        f.write(await segment.read())
+        f.write(data)
+
+    uploads_total.labels(video_id=video_id).inc()
+    upload_bytes_total.labels(video_id=video_id).inc(len(data))
 
     # Update segment_count in metadata if needed
     meta = videos_meta[video_id]
@@ -366,6 +409,8 @@ async def _save_segment(video_id: str, index: int, segment: UploadFile):
 
     # Fire-and-forget alignment check for audio/video timelines
     asyncio.create_task(verify_segment_alignment(video_id, index))
+
+    update_storage_metrics()
 
     return {"status": "ok", "index": index}
 
@@ -455,6 +500,9 @@ async def upload_manifest(video_id: str, request: Request):
     seg_count = videos_meta[video_id]["segment_count"]
     await scheduler.register_video(video_id, segment_count=seg_count)
 
+    upload_bytes_total.labels(video_id=video_id).inc(len(body))
+    update_storage_metrics()
+
     return {"status": "ok"}
 
 
@@ -497,6 +545,7 @@ async def get_segment(video_id: str, index: int):
         waited += 200
     if not os.path.exists(seg_path):
         raise HTTPException(status_code=404, detail="file does not exist")
+    players_total.inc()
     return FileResponse(seg_path, media_type="video/iso.segment")
 
 
@@ -509,11 +558,17 @@ async def upload_audio_segment(video_id: str, index: int, segment: UploadFile = 
     seg_filename = f"audio_segment_{index}.m4s"
     seg_path = os.path.join(video_dir, seg_filename)
 
+    data = await segment.read()
     with open(seg_path, "wb") as f:
-        f.write(await segment.read())
+        f.write(data)
+
+    upload_bytes_total.labels(video_id=video_id).inc(len(data))
+    uploads_total.labels(video_id=video_id).inc()
 
     # Re-check A/V alignment after writing audio
     asyncio.create_task(verify_segment_alignment(video_id, index))
+
+    update_storage_metrics()
 
     return {"status": "ok", "index": index}
 
