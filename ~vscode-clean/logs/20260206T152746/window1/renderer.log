@@ -1,1 +1,0 @@
-2026-02-06 15:27:53.285 [error] [File Watcher (node.js)] Failed to watch \\wsl.localhost\Ubuntu\home\chengji\projects\chunkstream\~vscode-clean\User for changes using fs.watch() (Error: EISDIR: illegal operation on a directory, watch '\\wsl.localhost\Ubuntu\home\chengji\projects\chunkstream\~vscode-clean\User')
