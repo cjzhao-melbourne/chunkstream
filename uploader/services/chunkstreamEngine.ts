@@ -571,10 +571,12 @@ export class ChunkstreamEngine {
   }
 
   private buildWebSocketUrl(): string | null {
-    const backendBase =
-      (import.meta as any)?.env?.VITE_BACKEND_BASE ||
-      (typeof window !== "undefined" ? (window as any).__CHUNKSTREAM_BACKEND_BASE__ : undefined) ||
-      "http://127.0.0.1:8000";
+    const envBase = (import.meta as any)?.env?.VITE_BACKEND_BASE;
+    const winBase =
+      typeof window !== "undefined"
+        ? (window as any).__CHUNKSTREAM_BACKEND_BASE__ || window.location?.origin
+        : undefined;
+    const backendBase = envBase || winBase || "http://127.0.0.1:8000";
     if (!backendBase) return null;
     const normalized = backendBase.replace(/\/$/, "");
     const wsBase = normalized.replace(/^http(s?)/i, (_m, s) => (s ? "wss" : "ws"));

@@ -1,11 +1,12 @@
 const DEFAULT_BACKEND_BASE = "http://127.0.0.1:8000";
 
-// Allow overriding the backend base URL via Vite env or a window flag for demos.
-const BACKEND_BASE = (
-  import.meta?.env?.VITE_BACKEND_BASE ||
-  (typeof window !== "undefined" ? (window as any).__CHUNKSTREAM_BACKEND_BASE__ : undefined) ||
-  DEFAULT_BACKEND_BASE
-).replace(/\/$/, "");
+const resolveBackendBase = () => {
+  const envBase = import.meta?.env?.VITE_BACKEND_BASE;
+  const winBase = typeof window !== "undefined" ? (window as any).__CHUNKSTREAM_BACKEND_BASE__ || window.location?.origin : undefined;
+  return (envBase || winBase || DEFAULT_BACKEND_BASE).replace(/\/$/, "");
+};
+
+const BACKEND_BASE = resolveBackendBase();
 
 const throwIfNotOk = (resp: Response, message: string) => {
   if (!resp.ok) {

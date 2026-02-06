@@ -1,0 +1,3 @@
+2026-02-06 15:26:12.200 [error] [File Watcher (node.js)] Failed to watch \\wsl.localhost\Ubuntu\home\chengji\projects\chunkstream\%TEMP%vscode-ext-clean for changes using fs.watch() (Error: EISDIR: illegal operation on a directory, watch '\\wsl.localhost\Ubuntu\home\chengji\projects\chunkstream\%TEMP%vscode-ext-clean')
+2026-02-06 15:26:12.225 [info] Started initializing default profile extensions in extensions installation folder. file://wsl.localhost/Ubuntu/home/chengji/projects/chunkstream/%25TEMP%25vscode-ext-clean
+2026-02-06 15:26:12.257 [info] Completed initializing default profile extensions in extensions installation folder. file://wsl.localhost/Ubuntu/home/chengji/projects/chunkstream/%25TEMP%25vscode-ext-clean

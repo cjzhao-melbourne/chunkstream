@@ -1,0 +1,13 @@
+2026-02-06 15:27:47.023 [info] update#setState idle
+2026-02-06 15:27:48.795 [error] [storage state.vscdb] exec(): Error: SQLITE_BUSY: database is locked
+2026-02-06 15:27:48.796 [error] [storage state.vscdb] open(): Unable to open DB due to Error: SQLITE_BUSY: database is locked
+2026-02-06 15:27:51.296 [error] [File Watcher (node.js)] Failed to watch \\wsl.localhost\Ubuntu\home\chengji\projects\chunkstream\~vscode-clean\User for changes using fs.watch() (Error: EISDIR: illegal operation on a directory, watch '\\wsl.localhost\Ubuntu\home\chengji\projects\chunkstream\~vscode-clean\User')
+2026-02-06 15:27:52.566 [error] [storage state.vscdb] exec(): Error: SQLITE_BUSY: database is locked
+2026-02-06 15:27:52.567 [error] [storage state.vscdb] open(): Unable to open DB due to Error: SQLITE_BUSY: database is locked
+2026-02-06 15:27:52.888 [error] [storage state.vscdb] exec(): Error: SQLITE_BUSY: database is locked
+2026-02-06 15:27:52.889 [error] [storage state.vscdb] open(): Unable to open DB due to Error: SQLITE_BUSY: database is locked
+2026-02-06 15:27:54.347 [error] [storage state.vscdb] exec(): Error: SQLITE_BUSY: database is locked
+2026-02-06 15:27:54.349 [error] [storage state.vscdb] open(): Unable to use backup due to Error: SQLITE_BUSY: database is locked
+2026-02-06 15:27:54.559 [error] [File Watcher (node.js)] Failed to watch \\wsl.localhost\Ubuntu\home\chengji\projects\chunkstream\~vscode-ext-clean for changes using fs.watch() (Error: EISDIR: illegal operation on a directory, watch '\\wsl.localhost\Ubuntu\home\chengji\projects\chunkstream\~vscode-ext-clean')
+2026-02-06 15:27:54.571 [error] [File Watcher (node.js)] Failed to watch \\wsl.localhost\Ubuntu\home\chengji\projects\chunkstream\~vscode-ext-clean\extensions.json for changes using fs.watch() (Error: EISDIR: illegal operation on a directory, watch '\\wsl.localhost\Ubuntu\home\chengji\projects\chunkstream\~vscode-ext-clean\extensions.json')
+2026-02-06 15:27:54.632 [error] [UtilityProcess type: shared-process, pid: 7452]: crashed with code -1073741819 and reason 'crashed'

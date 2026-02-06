@@ -1,0 +1,23 @@
+2026-02-06 15:26:04.756 [error] [File Watcher (node.js)] Failed to watch \\wsl.localhost\Ubuntu\home\chengji\projects\chunkstream\%TEMP%vscode-clean\User for changes using fs.watch() (Error: EISDIR: illegal operation on a directory, watch '\\wsl.localhost\Ubuntu\home\chengji\projects\chunkstream\%TEMP%vscode-clean\User')
+2026-02-06 15:26:04.774 [info] update#setState idle
+2026-02-06 15:26:06.544 [error] [storage state.vscdb] exec(): Error: SQLITE_BUSY: database is locked
+2026-02-06 15:26:06.545 [error] [storage state.vscdb] open(): Unable to open DB due to Error: SQLITE_BUSY: database is locked
+2026-02-06 15:26:09.019 [error] [File Watcher (node.js)] Failed to watch \\wsl.localhost\Ubuntu\home\chengji\projects\chunkstream\%TEMP%vscode-clean\User for changes using fs.watch() (Error: EISDIR: illegal operation on a directory, watch '\\wsl.localhost\Ubuntu\home\chengji\projects\chunkstream\%TEMP%vscode-clean\User')
+2026-02-06 15:26:10.349 [error] [storage state.vscdb] exec(): Error: SQLITE_BUSY: database is locked
+2026-02-06 15:26:10.350 [error] [storage state.vscdb] open(): Unable to open DB due to Error: SQLITE_BUSY: database is locked
+2026-02-06 15:26:10.597 [error] [storage state.vscdb] exec(): Error: SQLITE_BUSY: database is locked
+2026-02-06 15:26:10.599 [error] [storage state.vscdb] open(): Unable to open DB due to Error: SQLITE_BUSY: database is locked
+2026-02-06 15:26:12.147 [error] [storage state.vscdb] exec(): Error: SQLITE_BUSY: database is locked
+2026-02-06 15:26:12.148 [error] [storage state.vscdb] open(): Unable to use backup due to Error: SQLITE_BUSY: database is locked
+2026-02-06 15:26:12.286 [error] [File Watcher (node.js)] Failed to watch \\wsl.localhost\Ubuntu\home\chengji\projects\chunkstream\%TEMP%vscode-ext-clean for changes using fs.watch() (Error: EISDIR: illegal operation on a directory, watch '\\wsl.localhost\Ubuntu\home\chengji\projects\chunkstream\%TEMP%vscode-ext-clean')
+2026-02-06 15:26:12.297 [error] [File Watcher (node.js)] Failed to watch \\wsl.localhost\Ubuntu\home\chengji\projects\chunkstream\%TEMP%vscode-ext-clean\extensions.json for changes using fs.watch() (Error: EISDIR: illegal operation on a directory, watch '\\wsl.localhost\Ubuntu\home\chengji\projects\chunkstream\%TEMP%vscode-ext-clean\extensions.json')
+2026-02-06 15:26:12.343 [error] [UtilityProcess type: shared-process, pid: 25204]: crashed with code -1073741819 and reason 'crashed'
+2026-02-06 15:26:12.494 [error] CodeWindow: renderer process gone (reason: crashed, code: -1073741819)
+2026-02-06 15:26:12.708 [info] Extension host with pid 26784 exited with code: 0, signal: unknown.
+2026-02-06 15:26:14.394 [error] [storage state.vscdb] exec(): Error: SQLITE_BUSY: database is locked
+2026-02-06 15:26:14.395 [error] [storage state.vscdb] open(): Unable to open DB due to Error: SQLITE_BUSY: database is locked
+2026-02-06 15:26:16.195 [error] [storage state.vscdb] exec(): Error: SQLITE_BUSY: database is locked
+2026-02-06 15:26:16.197 [error] [storage state.vscdb] open(): Unable to use backup due to Error: SQLITE_BUSY: database is locked
+2026-02-06 15:26:19.551 [error] [storage state.vscdb] exec(): Error: SQLITE_BUSY: database is locked
+2026-02-06 15:26:19.552 [error] [storage state.vscdb] exec(): Error: SQLITE_BUSY: database is locked
+2026-02-06 15:26:19.553 [error] Error: SQLITE_BUSY: database is locked
