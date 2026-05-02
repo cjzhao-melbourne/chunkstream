@@ -2,7 +2,7 @@ const DEFAULT_BACKEND_BASE = "http://127.0.0.1:8000";
 
 const resolveBackendBase = () => {
   const envBase = import.meta?.env?.VITE_BACKEND_BASE;
-  const winBase = typeof window !== "undefined" ? (window as any).__CHUNKSTREAM_BACKEND_BASE__ || window.location?.origin : undefined;
+  const winBase = typeof window !== "undefined" ? (window as any).__CHUNKSTREAM_BACKEND_BASE__ : undefined;
   return (envBase || winBase || DEFAULT_BACKEND_BASE).replace(/\/$/, "");
 };
 
@@ -23,5 +23,9 @@ export const playerService = {
 
   getManifestUrl(videoId: string): string {
     return `${BACKEND_BASE}/videos/${videoId}/manifest.mpd`;
+  },
+
+  getMultibitrateDashUrl(videoId: string): string {
+    return `${BACKEND_BASE}/videos/${videoId}/dash/manifest.mpd`;
   }
 };

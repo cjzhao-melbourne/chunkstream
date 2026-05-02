@@ -574,7 +574,7 @@ export class ChunkstreamEngine {
     const envBase = (import.meta as any)?.env?.VITE_BACKEND_BASE;
     const winBase =
       typeof window !== "undefined"
-        ? (window as any).__CHUNKSTREAM_BACKEND_BASE__ || window.location?.origin
+        ? (window as any).__CHUNKSTREAM_BACKEND_BASE__
         : undefined;
     const backendBase = envBase || winBase || "http://127.0.0.1:8000";
     if (!backendBase) return null;

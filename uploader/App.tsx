@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { ChunkstreamEngine } from './services/chunkstreamEngine';
+import { playerService } from './services/playerService';
 import { SegmentInfo } from './types';
 import { Button } from './components/Button';
 import { ProgressBar } from './components/ProgressBar';
@@ -57,9 +58,10 @@ const App: React.FC = () => {
     engine.onLog = addLog;
     engine.onProgress = setSegments;
     engine.onReadyToPlay = (url, vId) => {
-      setManifestUrl(url);
+      // MPD is pre-generated on backend at init time — use multi-bitrate directly
+      setManifestUrl(playerService.getMultibitrateDashUrl(vId));
       setVideoId(vId);
-      addLog(`Ready to play! URL: ${url}`);
+      addLog(`Ready to play! (multi-bitrate DASH)`);
     };
 
     engineRef.current = engine;

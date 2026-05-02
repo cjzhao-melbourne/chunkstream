@@ -9,6 +9,8 @@ services:
       - ./backend/storage:/app/storage
     environment:
       - PYTHONUNBUFFERED=1
+      - TRANSCODER=ffmpeg          # switch to "livepeer" in production
+      # - LIVEPEER_URL=http://livepeer:8935
 
   frontend:
     build:

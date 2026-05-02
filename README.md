@@ -119,3 +119,16 @@ chunkstream/
 └── uploader/
     ├── index.html       # Upload + preview UI
     └── app.tsx           # Browser logic: analyze, chunk, upload, play
+
+---
+
+## 6. how to run
+
+cd backend
+source venv/bin/activate
+TRANSCODER=ffmpeg uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+cd uploader
+VITE_BACKEND_BASE=http://localhost:8000 npm run dev
+
+---

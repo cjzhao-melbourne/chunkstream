@@ -10,6 +10,7 @@ import shutil
 from datetime import datetime
 from typing import Dict, Any, Set
 from collections import defaultdict
+from xml.etree import ElementTree as ET
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -28,6 +29,9 @@ from models import (
     TaskInfo,
 )
 from scheduler import UploadScheduler
+from transcoder import get_transcoder, PROFILES
+from transcode_queue import TranscodeQueue
+from hls_builder import HLSBuilder
 
 # ---------------- Basic Initialization ----------------
 
@@ -51,6 +55,80 @@ videos_meta: Dict[str, Dict[str, Any]] = {}
 
 # Scheduler instance
 scheduler = UploadScheduler()
+
+# Transcoding pipeline
+hls_builder    = HLSBuilder()
+_transcoder    = get_transcoder()
+
+# Sorted highest bitrate first for MPD Representation ordering
+_PROFILES_SORTED = sorted(PROFILES, key=lambda p: p["bitrate"], reverse=True)
+
+
+def _generate_dash_mpd(video_dir: str, segment_count: int, segment_duration: float) -> None:
+    """
+    Write a static DASH MPD with all segment_count segments pre-listed.
+    Called at video init time so the full manifest is available immediately.
+    """
+    dash_dir = os.path.join(video_dir, "dash")
+    os.makedirs(dash_dir, exist_ok=True)
+
+    total = segment_count * segment_duration
+    dur_ms = round(segment_duration * 1000)
+
+    mpd = ET.Element("MPD", {
+        "xmlns": "urn:mpeg:dash:schema:mpd:2011",
+        "type": "static",
+        "mediaPresentationDuration": f"PT{total:.3f}S",
+        "minBufferTime": "PT2S",
+        "profiles": "urn:mpeg:dash:profile:isoff-live:2011",
+    })
+
+    period = ET.SubElement(mpd, "Period", {"start": "PT0S"})
+    adaptation = ET.SubElement(period, "AdaptationSet", {
+        "mimeType": "video/mp4",
+        "segmentAlignment": "true",
+        "startWithSAP": "1",
+    })
+
+    for profile in _PROFILES_SORTED:
+        name = profile["name"]
+        rep = ET.SubElement(adaptation, "Representation", {
+            "id": name,
+            "bandwidth": str(profile["bitrate"]),
+            "width": str(profile["width"]),
+            "height": str(profile["height"]),
+            "codecs": "avc1.4D401F",
+        })
+        seg_template = ET.SubElement(rep, "SegmentTemplate", {
+            "initialization": f"{name}/init.m4s",
+            "media": f"{name}/segment_$Number$.m4s",
+            "startNumber": "0",
+            "timescale": "1000",
+        })
+        timeline = ET.SubElement(seg_template, "SegmentTimeline")
+        ET.SubElement(timeline, "S", {"d": str(dur_ms), "r": str(segment_count - 1)})
+
+    ET.indent(mpd, space="  ")
+    content = '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(mpd, encoding="unicode")
+
+    mpd_path = os.path.join(dash_dir, "manifest.mpd")
+    with open(mpd_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    logger.info(f"Generated DASH MPD: {mpd_path} ({segment_count} segments, {segment_duration}s each)")
+
+
+async def _on_transcode_done(video_id: str, index: int, renditions: list):
+    meta = videos_meta.get(video_id)
+    if meta:
+        await hls_builder.add_segment(video_id, index, renditions, meta["dir"])
+
+transcode_queue = TranscodeQueue(transcoder=_transcoder, on_done=_on_transcode_done)
+
+
+@app.on_event("startup")
+async def _startup():
+    transcode_queue.start()
 
 # -------- Metrics (Prometheus) --------
 # Exposed at /metrics by Instrumentator below.
@@ -286,6 +364,10 @@ async def init_video(req: InitUploadRequest):
         segment_duration=req.segment_duration,
     )
 
+    # Pre-generate a static DASH MPD immediately so the player can start without polling
+    if req.segment_count is not None and req.segment_duration is not None:
+        _generate_dash_mpd(video_dir, req.segment_count, req.segment_duration)
+
     update_storage_metrics()
 
     return InitUploadResponse(video_id=video_id)
@@ -412,6 +494,16 @@ async def _save_segment(video_id: str, index: int, segment: UploadFile):
     # Fire-and-forget alignment check for audio/video timelines
     asyncio.create_task(verify_segment_alignment(video_id, index))
 
+    # Enqueue transcoding — priority derived from current heat
+    vs  = scheduler.videos.get(video_id)
+    hot = vs.segments[index].hot_count if (vs and index in vs.segments) else 0
+    await transcode_queue.enqueue(
+        video_id=video_id, index=index,
+        video_dir=videos_meta[video_id]["dir"],
+        seg_duration=videos_meta[video_id].get("segment_duration"),
+        priority=max(0, 10 - hot),
+    )
+
     update_storage_metrics()
 
     return {"status": "ok", "index": index}
@@ -461,6 +553,16 @@ async def prioritize_segment(video_id: str, req: PriorityRequest):
 
     await scheduler.bump_priority_around(video_id, req.index)
     await broadcast_priority(video_id, priority_window_indexes(video_id, req.index))
+
+    # Seek window gets highest transcode priority
+    meta = videos_meta[video_id]
+    for i in priority_window_indexes(video_id, req.index):
+        await transcode_queue.enqueue(
+            video_id=video_id, index=i,
+            video_dir=meta["dir"],
+            seg_duration=meta.get("segment_duration"),
+            priority=0,
+        )
     return {"status": "ok", "index": req.index}
 
 
@@ -476,6 +578,16 @@ async def prioritize_segment_with_path(video_id: str, index: int):
 
     await scheduler.bump_priority_around(video_id, index)
     await broadcast_priority(video_id, priority_window_indexes(video_id, index))
+
+    # Seek window gets highest transcode priority
+    meta = videos_meta[video_id]
+    for i in priority_window_indexes(video_id, index):
+        await transcode_queue.enqueue(
+            video_id=video_id, index=i,
+            video_dir=meta["dir"],
+            seg_duration=meta.get("segment_duration"),
+            priority=0,
+        )
     return {"status": "ok", "index": index}
 
 # ---------------- API: Upload/get MPD manifest ----------------
@@ -659,3 +771,148 @@ async def get_next_tasks(video_id: str, uploader_id: str, req: NextTasksRequest)
 
     tasks = [TaskInfo(index=s.index, priority=s.effective_priority) for s in segs]
     return NextTasksResponse(tasks=tasks)
+
+
+# ---------------- API: HLS playback (multi-bitrate) ----------------
+
+
+@app.get("/videos/{video_id}/hls/master.m3u8")
+async def get_hls_master(video_id: str):
+    if video_id not in videos_meta:
+        raise HTTPException(status_code=404, detail="video_id does not exist")
+    path = os.path.join(videos_meta[video_id]["dir"], "hls", "master.m3u8")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="HLS not ready yet")
+    return FileResponse(path, media_type="application/vnd.apple.mpegurl",
+                        headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/videos/{video_id}/hls/{rendition}/playlist.m3u8")
+async def get_hls_playlist(video_id: str, rendition: str):
+    if video_id not in videos_meta:
+        raise HTTPException(status_code=404, detail="video_id does not exist")
+    path = os.path.join(videos_meta[video_id]["dir"], "hls", rendition, "playlist.m3u8")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="rendition not ready yet")
+    return FileResponse(path, media_type="application/vnd.apple.mpegurl",
+                        headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/videos/{video_id}/hls/{rendition}/segment_{index}.ts")
+async def get_hls_segment(video_id: str, rendition: str, index: int):
+    if video_id not in videos_meta:
+        raise HTTPException(status_code=404, detail="video_id does not exist")
+    path = os.path.join(
+        videos_meta[video_id]["dir"], "hls", rendition, f"segment_{index}.ts"
+    )
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="segment not transcoded yet")
+    return FileResponse(path, media_type="video/MP2T",
+                        headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+# ---------------- API: DASH playback (multi-bitrate adaptive) ----------------
+
+
+@app.get("/videos/{video_id}/dash/manifest.mpd")
+async def get_dash_manifest(video_id: str):
+    if video_id not in videos_meta:
+        raise HTTPException(status_code=404, detail="video_id does not exist")
+    path = os.path.join(videos_meta[video_id]["dir"], "dash", "manifest.mpd")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="DASH manifest not ready yet")
+    return FileResponse(
+        path,
+        media_type="application/dash+xml",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/videos/{video_id}/dash/{rendition}/init.m4s")
+async def get_dash_init(video_id: str, rendition: str):
+    if video_id not in videos_meta:
+        raise HTTPException(status_code=404, detail="video_id does not exist")
+    path = os.path.join(
+        videos_meta[video_id]["dir"], "dash", rendition, "init.m4s"
+    )
+    if not os.path.exists(path):
+        # Trigger JIT transcoding of segment 0 (which will produce init.m4s)
+        meta = videos_meta[video_id]
+        await transcode_queue.enqueue(
+            video_id=video_id, index=0,
+            video_dir=meta["dir"],
+            seg_duration=meta.get("segment_duration"),
+            priority=0,
+        )
+        # Poll until init.m4s appears (up to 120 seconds)
+        for _ in range(600):
+            if os.path.exists(path):
+                break
+            await asyncio.sleep(0.2)
+        else:
+            raise HTTPException(status_code=503, detail="DASH init segment timed out")
+    return FileResponse(
+        path,
+        media_type="video/iso.segment",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+@app.get("/videos/{video_id}/dash/{rendition}/segment_{index}.m4s")
+async def get_dash_segment(video_id: str, rendition: str, index: int):
+    if video_id not in videos_meta:
+        raise HTTPException(status_code=404, detail="video_id does not exist")
+    meta = videos_meta[video_id]
+    path = os.path.join(meta["dir"], "dash", rendition, f"segment_{index}.m4s")
+
+    async def _prefetch_next():
+        """Enqueue the next 3 segments for prefetch in the background."""
+        for offset, pri in enumerate([1, 2, 3], start=1):
+            await transcode_queue.enqueue(
+                video_id=video_id, index=index + offset,
+                video_dir=meta["dir"],
+                seg_duration=meta.get("segment_duration"),
+                priority=pri,
+            )
+
+    if os.path.exists(path):
+        # Segment already transcoded — serve immediately and prefetch next ones
+        asyncio.create_task(_prefetch_next())
+    else:
+        # JIT: enqueue this segment with highest priority, prefetch next 3
+        await transcode_queue.enqueue(
+            video_id=video_id, index=index,
+            video_dir=meta["dir"],
+            seg_duration=meta.get("segment_duration"),
+            priority=0,
+        )
+        asyncio.create_task(_prefetch_next())
+
+        # Poll until segment appears (up to 120 seconds)
+        for _ in range(600):
+            if os.path.exists(path):
+                break
+            await asyncio.sleep(0.2)
+        else:
+            raise HTTPException(status_code=503, detail="DASH segment timed out")
+
+    players_total.inc()
+    return FileResponse(
+        path,
+        media_type="video/iso.segment",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+# ---------------- API: Transcode status (debug/monitoring) ----------------
+
+
+@app.get("/videos/{video_id}/transcode/status")
+async def get_transcode_status(video_id: str):
+    if video_id not in videos_meta:
+        raise HTTPException(status_code=404, detail="video_id does not exist")
+    return {
+        "job_states":     transcode_queue.job_states(video_id),
+        "hls_segments":   hls_builder.segment_count(video_id),
+        "hls_ready":      hls_builder.is_ready(video_id),
+    }
