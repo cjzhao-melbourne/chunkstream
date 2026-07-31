@@ -23,7 +23,7 @@ The backend is written in **Python**, designed to be extended with **video trans
 
 ## 30-Second Demo
 
-[![Watch the ChunkStream demo](https://img.youtube.com/vi/vGDgNL_T8lA/maxresdefault.jpg)](https://studio.youtube.com/video/vGDgNL_T8lA/edit)
+[![Watch the ChunkStream demo](https://img.youtube.com/vi/vGDgNL_T8lA/maxresdefault.jpg)](https://www.youtube.com/watch?v=vGDgNL_T8lA)
 
 **Click the image to watch how ChunkStream makes a large video shareable and playable while it is still uploading.**
 
