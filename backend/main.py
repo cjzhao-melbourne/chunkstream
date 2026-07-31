@@ -4,11 +4,12 @@ import uuid
 import logging
 import asyncio
 import json
+import math
 import subprocess
 import tempfile
 import shutil
 from datetime import datetime
-from typing import Dict, Any, Set
+from typing import Dict, Any, Set, Optional
 from collections import defaultdict
 from xml.etree import ElementTree as ET
 
@@ -29,9 +30,8 @@ from models import (
     TaskInfo,
 )
 from scheduler import UploadScheduler
-from transcoder import get_transcoder, PROFILES
+from transcoder import get_transcoder, PROFILES, SOURCE_RENDITION, select_ladder, remux_source_to_ts
 from transcode_queue import TranscodeQueue
-from hls_builder import HLSBuilder
 
 # ---------------- Basic Initialization ----------------
 
@@ -57,17 +57,22 @@ videos_meta: Dict[str, Dict[str, Any]] = {}
 scheduler = UploadScheduler()
 
 # Transcoding pipeline
-hls_builder    = HLSBuilder()
 _transcoder    = get_transcoder()
 
-# Sorted highest bitrate first for MPD Representation ordering
-_PROFILES_SORTED = sorted(PROFILES, key=lambda p: p["bitrate"], reverse=True)
 
-
-def _generate_dash_mpd(video_dir: str, segment_count: int, segment_duration: float) -> None:
+def _generate_dash_mpd(
+    video_dir: str,
+    segment_count: int,
+    segment_duration: float,
+    ladder_profiles: list,
+    source_bitrate: Optional[int] = None,
+    source_width: Optional[int] = None,
+    source_height: Optional[int] = None,
+) -> None:
     """
     Write a static DASH MPD with all segment_count segments pre-listed.
-    Called at video init time so the full manifest is available immediately.
+    Source rendition (served from raw uploaded files) is listed first when
+    source info is provided; transcoded ladder profiles follow in descending order.
     """
     dash_dir = os.path.join(video_dir, "dash")
     os.makedirs(dash_dir, exist_ok=True)
@@ -90,13 +95,12 @@ def _generate_dash_mpd(video_dir: str, segment_count: int, segment_duration: flo
         "startWithSAP": "1",
     })
 
-    for profile in _PROFILES_SORTED:
-        name = profile["name"]
+    def _add_rep(name: str, bitrate: int, width: int, height: int):
         rep = ET.SubElement(adaptation, "Representation", {
             "id": name,
-            "bandwidth": str(profile["bitrate"]),
-            "width": str(profile["width"]),
-            "height": str(profile["height"]),
+            "bandwidth": str(bitrate),
+            "width": str(width),
+            "height": str(height),
             "codecs": "avc1.4D401F",
         })
         seg_template = ET.SubElement(rep, "SegmentTemplate", {
@@ -108,6 +112,12 @@ def _generate_dash_mpd(video_dir: str, segment_count: int, segment_duration: flo
         timeline = ET.SubElement(seg_template, "SegmentTimeline")
         ET.SubElement(timeline, "S", {"d": str(dur_ms), "r": str(segment_count - 1)})
 
+    if source_bitrate and source_width and source_height:
+        _add_rep(SOURCE_RENDITION, source_bitrate, source_width, source_height)
+
+    for profile in sorted(ladder_profiles, key=lambda p: p["bitrate"], reverse=True):
+        _add_rep(profile["name"], profile["bitrate"], profile["width"], profile["height"])
+
     ET.indent(mpd, space="  ")
     content = '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(mpd, encoding="unicode")
 
@@ -118,12 +128,63 @@ def _generate_dash_mpd(video_dir: str, segment_count: int, segment_duration: flo
     logger.info(f"Generated DASH MPD: {mpd_path} ({segment_count} segments, {segment_duration}s each)")
 
 
-async def _on_transcode_done(video_id: str, index: int, renditions: list):
-    meta = videos_meta.get(video_id)
-    if meta:
-        await hls_builder.add_segment(video_id, index, renditions, meta["dir"])
+def _generate_hls_playlists(
+    video_dir: str,
+    segment_count: int,
+    segment_duration: float,
+    ladder_profiles: list,
+    source_bitrate: Optional[int] = None,
+    source_width: Optional[int] = None,
+    source_height: Optional[int] = None,
+) -> None:
+    """
+    Pre-generate static HLS master + per-rendition playlists at init time.
+    Segment .ts files don't exist yet; they are produced JIT on first request.
+    Source rendition (remuxed fMP4→TS on demand) is listed first when source info provided.
+    """
+    hls_dir = os.path.join(video_dir, "hls")
+    target_duration = math.ceil(segment_duration)
 
-transcode_queue = TranscodeQueue(transcoder=_transcoder, on_done=_on_transcode_done)
+    master_renditions: list[dict] = []
+
+    def _write_rendition_playlist(name: str, bitrate: int, width: int, height: int):
+        rendition_dir = os.path.join(hls_dir, name)
+        os.makedirs(rendition_dir, exist_ok=True)
+        lines = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:3",
+            f"#EXT-X-TARGETDURATION:{target_duration}",
+            "#EXT-X-PLAYLIST-TYPE:VOD",
+        ]
+        for i in range(segment_count):
+            lines.append(f"#EXTINF:{segment_duration:.3f},")
+            lines.append(f"segment_{i}.ts")
+        lines.append("#EXT-X-ENDLIST")
+        with open(os.path.join(rendition_dir, "playlist.m3u8"), "w") as f:
+            f.write("\n".join(lines) + "\n")
+        master_renditions.append({"name": name, "bitrate": bitrate, "width": width, "height": height})
+
+    if source_bitrate and source_width and source_height:
+        _write_rendition_playlist(SOURCE_RENDITION, source_bitrate, source_width, source_height)
+
+    for profile in sorted(ladder_profiles, key=lambda p: p["bitrate"], reverse=True):
+        _write_rendition_playlist(profile["name"], profile["bitrate"], profile["width"], profile["height"])
+
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
+    for r in master_renditions:
+        lines.append(
+            f'#EXT-X-STREAM-INF:BANDWIDTH={r["bitrate"]},'
+            f'RESOLUTION={r["width"]}x{r["height"]},'
+            f'NAME="{r["name"]}"'
+        )
+        lines.append(f'{r["name"]}/playlist.m3u8')
+    with open(os.path.join(hls_dir, "master.m3u8"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    logger.info(f"Generated HLS playlists: {hls_dir} ({segment_count} segments, {segment_duration}s each)")
+
+
+transcode_queue = TranscodeQueue(transcoder=_transcoder)
 
 
 @app.on_event("startup")
@@ -244,9 +305,9 @@ async def verify_segment_alignment(video_id: str, index: int):
   seg_duration = videos_meta.get(video_id, {}).get("segment_duration")
   if not video_dir:
     return
-  v_seg = os.path.join(video_dir, f"segment_{index}.m4s")
+  v_seg = os.path.join(video_dir, "dash", SOURCE_RENDITION, f"segment_{index}.m4s")
   a_seg = os.path.join(video_dir, f"audio_segment_{index}.m4s")
-  v_init = os.path.join(video_dir, "init.m4s")
+  v_init = os.path.join(video_dir, "dash", SOURCE_RENDITION, "init.m4s")
   a_init = os.path.join(video_dir, "audio_init.m4s")
   if not os.path.exists(v_seg):
     return
@@ -348,6 +409,12 @@ async def init_video(req: InitUploadRequest):
     video_dir = os.path.join(BASE_STORAGE, video_id)
     os.makedirs(video_dir, exist_ok=True)
 
+    ladder_profiles = (
+        select_ladder(req.source_bitrate, req.source_height)
+        if req.source_bitrate is not None and req.source_height is not None
+        else list(PROFILES)
+    )
+
     videos_meta[video_id] = {
         "filename": req.filename,
         "size": req.size,
@@ -355,6 +422,10 @@ async def init_video(req: InitUploadRequest):
         "segment_count": req.segment_count,
         "segment_duration": req.segment_duration,
         "manifest_uploaded": False,
+        "source_width": req.source_width,
+        "source_height": req.source_height,
+        "source_bitrate": req.source_bitrate,
+        "ladder_profiles": ladder_profiles,
     }
 
     # Register the video in the scheduler
@@ -364,9 +435,20 @@ async def init_video(req: InitUploadRequest):
         segment_duration=req.segment_duration,
     )
 
-    # Pre-generate a static DASH MPD immediately so the player can start without polling
+    # Pre-generate static manifests so the player can start without polling
     if req.segment_count is not None and req.segment_duration is not None:
-        _generate_dash_mpd(video_dir, req.segment_count, req.segment_duration)
+        _generate_dash_mpd(
+            video_dir, req.segment_count, req.segment_duration, ladder_profiles,
+            source_bitrate=req.source_bitrate,
+            source_width=req.source_width,
+            source_height=req.source_height,
+        )
+        _generate_hls_playlists(
+            video_dir, req.segment_count, req.segment_duration, ladder_profiles,
+            source_bitrate=req.source_bitrate,
+            source_width=req.source_width,
+            source_height=req.source_height,
+        )
 
     update_storage_metrics()
 
@@ -381,10 +463,11 @@ async def upload_init_segment(video_id: str, init: UploadFile = File(...)):
         raise HTTPException(status_code=404, detail="video_id does not exist")
 
     video_dir = videos_meta[video_id]["dir"]
-    init_path = os.path.join(video_dir, "init.m4s")
+    dash_source_dir = os.path.join(video_dir, "dash", SOURCE_RENDITION)
+    os.makedirs(dash_source_dir, exist_ok=True)
 
     data = await init.read()
-    with open(init_path, "wb") as f:
+    with open(os.path.join(dash_source_dir, "init.m4s"), "wb") as f:
         f.write(data)
 
     upload_bytes_total.labels(video_id=video_id).inc(len(data))
@@ -398,7 +481,7 @@ async def get_init_segment(video_id: str, request: Request):
     if video_id not in videos_meta:
         raise HTTPException(status_code=404, detail="video_id does not exist")
     video_dir = videos_meta[video_id]["dir"]
-    init_path = os.path.join(video_dir, "init.m4s")
+    init_path = os.path.join(video_dir, "dash", SOURCE_RENDITION, "init.m4s")
     if not os.path.exists(init_path):
         raise HTTPException(status_code=404, detail="init segment does not exist")
 
@@ -473,9 +556,10 @@ async def _save_segment(video_id: str, index: int, segment: UploadFile):
 
     video_dir = videos_meta[video_id]["dir"]
     seg_filename = f"segment_{index}.m4s"
-    seg_path = os.path.join(video_dir, seg_filename)
+    dash_source_dir = os.path.join(video_dir, "dash", SOURCE_RENDITION)
+    os.makedirs(dash_source_dir, exist_ok=True)
+    seg_path = os.path.join(dash_source_dir, seg_filename)
 
-    # Save the segment file
     data = await segment.read()
     with open(seg_path, "wb") as f:
         f.write(data)
@@ -493,16 +577,6 @@ async def _save_segment(video_id: str, index: int, segment: UploadFile):
 
     # Fire-and-forget alignment check for audio/video timelines
     asyncio.create_task(verify_segment_alignment(video_id, index))
-
-    # Enqueue transcoding — priority derived from current heat
-    vs  = scheduler.videos.get(video_id)
-    hot = vs.segments[index].hot_count if (vs and index in vs.segments) else 0
-    await transcode_queue.enqueue(
-        video_id=video_id, index=index,
-        video_dir=videos_meta[video_id]["dir"],
-        seg_duration=videos_meta[video_id].get("segment_duration"),
-        priority=max(0, 10 - hot),
-    )
 
     update_storage_metrics()
 
@@ -547,7 +621,7 @@ async def prioritize_segment(video_id: str, req: PriorityRequest):
         raise HTTPException(status_code=404, detail="video_id does not exist")
 
     # If the segment is missing, wait briefly for the uploader to produce it
-    seg_path = os.path.join(videos_meta[video_id]["dir"], f"segment_{req.index}.m4s")
+    seg_path = os.path.join(videos_meta[video_id]["dir"], "dash", SOURCE_RENDITION, f"segment_{req.index}.m4s")
     if not os.path.exists(seg_path):
         await asyncio.sleep(0.2)
 
@@ -556,12 +630,14 @@ async def prioritize_segment(video_id: str, req: PriorityRequest):
 
     # Seek window gets highest transcode priority
     meta = videos_meta[video_id]
+    ladder = meta.get("ladder_profiles") or None
     for i in priority_window_indexes(video_id, req.index):
         await transcode_queue.enqueue(
             video_id=video_id, index=i,
             video_dir=meta["dir"],
             seg_duration=meta.get("segment_duration"),
             priority=0,
+            profiles=ladder,
         )
     return {"status": "ok", "index": req.index}
 
@@ -572,21 +648,22 @@ async def prioritize_segment_with_path(video_id: str, index: int):
     if video_id not in videos_meta:
         raise HTTPException(status_code=404, detail="video_id does not exist")
 
-    seg_path = os.path.join(videos_meta[video_id]["dir"], f"segment_{index}.m4s")
+    seg_path = os.path.join(videos_meta[video_id]["dir"], "dash", SOURCE_RENDITION, f"segment_{index}.m4s")
     if not os.path.exists(seg_path):
         await asyncio.sleep(0.2)
 
     await scheduler.bump_priority_around(video_id, index)
     await broadcast_priority(video_id, priority_window_indexes(video_id, index))
 
-    # Seek window gets highest transcode priority
     meta = videos_meta[video_id]
+    ladder = meta.get("ladder_profiles") or None
     for i in priority_window_indexes(video_id, index):
         await transcode_queue.enqueue(
             video_id=video_id, index=i,
             video_dir=meta["dir"],
             seg_duration=meta.get("segment_duration"),
             priority=0,
+            profiles=ladder,
         )
     return {"status": "ok", "index": index}
 
@@ -638,7 +715,7 @@ async def get_segment(video_id: str, index: int):
     if video_id not in videos_meta:
         raise HTTPException(status_code=404, detail="video_id does not exist")
     video_dir = videos_meta[video_id]["dir"]
-    seg_path = os.path.join(video_dir, f"segment_{index}.m4s")
+    seg_path = os.path.join(video_dir, "dash", SOURCE_RENDITION, f"segment_{index}.m4s")
     # For player seeks requesting future segments, wait briefly for uploader;
     # also push the target segment into the priority queue to prompt upload.
     max_wait_ms = 10000
@@ -802,11 +879,55 @@ async def get_hls_playlist(video_id: str, rendition: str):
 async def get_hls_segment(video_id: str, rendition: str, index: int):
     if video_id not in videos_meta:
         raise HTTPException(status_code=404, detail="video_id does not exist")
-    path = os.path.join(
-        videos_meta[video_id]["dir"], "hls", rendition, f"segment_{index}.ts"
-    )
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="segment not transcoded yet")
+    meta = videos_meta[video_id]
+
+    if rendition == SOURCE_RENDITION:
+        # Source quality: remux fMP4→TS without re-encoding
+        path = os.path.join(meta["dir"], "hls", SOURCE_RENDITION, f"segment_{index}.ts")
+        if not os.path.exists(path):
+            init_path = os.path.join(meta["dir"], "dash", SOURCE_RENDITION, "init.m4s")
+            seg_path  = os.path.join(meta["dir"], "dash", SOURCE_RENDITION, f"segment_{index}.m4s")
+            for _ in range(600):
+                if os.path.exists(init_path) and os.path.exists(seg_path):
+                    break
+                await asyncio.sleep(0.2)
+            else:
+                raise HTTPException(status_code=503, detail="source segment timed out")
+            await remux_source_to_ts(init_path, seg_path, os.path.join(meta["dir"], "hls"), index)
+        return FileResponse(path, media_type="video/MP2T",
+                            headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+    ladder = meta.get("ladder_profiles") or None
+    path = os.path.join(meta["dir"], "hls", rendition, f"segment_{index}.ts")
+
+    async def _prefetch_next():
+        for offset, pri in enumerate([1, 2, 3], start=1):
+            await transcode_queue.enqueue(
+                video_id=video_id, index=index + offset,
+                video_dir=meta["dir"],
+                seg_duration=meta.get("segment_duration"),
+                priority=pri,
+                profiles=ladder,
+            )
+
+    if os.path.exists(path):
+        asyncio.create_task(_prefetch_next())
+    else:
+        await transcode_queue.enqueue(
+            video_id=video_id, index=index,
+            video_dir=meta["dir"],
+            seg_duration=meta.get("segment_duration"),
+            priority=0,
+            profiles=ladder,
+        )
+        asyncio.create_task(_prefetch_next())
+        for _ in range(600):
+            if os.path.exists(path):
+                break
+            await asyncio.sleep(0.2)
+        else:
+            raise HTTPException(status_code=503, detail="HLS segment timed out")
+
     return FileResponse(path, media_type="video/MP2T",
                         headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
@@ -832,30 +953,28 @@ async def get_dash_manifest(video_id: str):
 async def get_dash_init(video_id: str, rendition: str):
     if video_id not in videos_meta:
         raise HTTPException(status_code=404, detail="video_id does not exist")
-    path = os.path.join(
-        videos_meta[video_id]["dir"], "dash", rendition, "init.m4s"
-    )
+    meta = videos_meta[video_id]
+
+    path = os.path.join(meta["dir"], "dash", rendition, "init.m4s")
     if not os.path.exists(path):
-        # Trigger JIT transcoding of segment 0 (which will produce init.m4s)
-        meta = videos_meta[video_id]
-        await transcode_queue.enqueue(
-            video_id=video_id, index=0,
-            video_dir=meta["dir"],
-            seg_duration=meta.get("segment_duration"),
-            priority=0,
-        )
-        # Poll until init.m4s appears (up to 120 seconds)
+        if rendition != SOURCE_RENDITION:
+            # JIT: trigger transcoding of segment 0 to produce init.m4s
+            await transcode_queue.enqueue(
+                video_id=video_id, index=0,
+                video_dir=meta["dir"],
+                seg_duration=meta.get("segment_duration"),
+                priority=0,
+                profiles=meta.get("ladder_profiles") or None,
+            )
+        # Wait for file — source: from upload; others: from transcoder
         for _ in range(600):
             if os.path.exists(path):
                 break
             await asyncio.sleep(0.2)
         else:
             raise HTTPException(status_code=503, detail="DASH init segment timed out")
-    return FileResponse(
-        path,
-        media_type="video/iso.segment",
-        headers={"Cache-Control": "public, max-age=31536000, immutable"},
-    )
+    return FileResponse(path, media_type="video/iso.segment",
+                        headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 
 @app.get("/videos/{video_id}/dash/{rendition}/segment_{index}.m4s")
@@ -863,32 +982,35 @@ async def get_dash_segment(video_id: str, rendition: str, index: int):
     if video_id not in videos_meta:
         raise HTTPException(status_code=404, detail="video_id does not exist")
     meta = videos_meta[video_id]
+
+    ladder = meta.get("ladder_profiles") or None
     path = os.path.join(meta["dir"], "dash", rendition, f"segment_{index}.m4s")
 
     async def _prefetch_next():
-        """Enqueue the next 3 segments for prefetch in the background."""
         for offset, pri in enumerate([1, 2, 3], start=1):
             await transcode_queue.enqueue(
                 video_id=video_id, index=index + offset,
                 video_dir=meta["dir"],
                 seg_duration=meta.get("segment_duration"),
                 priority=pri,
+                profiles=ladder,
             )
 
     if os.path.exists(path):
-        # Segment already transcoded — serve immediately and prefetch next ones
-        asyncio.create_task(_prefetch_next())
+        if rendition != SOURCE_RENDITION:
+            asyncio.create_task(_prefetch_next())
     else:
-        # JIT: enqueue this segment with highest priority, prefetch next 3
-        await transcode_queue.enqueue(
-            video_id=video_id, index=index,
-            video_dir=meta["dir"],
-            seg_duration=meta.get("segment_duration"),
-            priority=0,
-        )
-        asyncio.create_task(_prefetch_next())
-
-        # Poll until segment appears (up to 120 seconds)
+        if rendition != SOURCE_RENDITION:
+            # JIT: transcode this segment, prefetch next 3
+            await transcode_queue.enqueue(
+                video_id=video_id, index=index,
+                video_dir=meta["dir"],
+                seg_duration=meta.get("segment_duration"),
+                priority=0,
+                profiles=ladder,
+            )
+            asyncio.create_task(_prefetch_next())
+        # Wait for file — source: from upload; others: from transcoder
         for _ in range(600):
             if os.path.exists(path):
                 break
@@ -912,7 +1034,5 @@ async def get_transcode_status(video_id: str):
     if video_id not in videos_meta:
         raise HTTPException(status_code=404, detail="video_id does not exist")
     return {
-        "job_states":     transcode_queue.job_states(video_id),
-        "hls_segments":   hls_builder.segment_count(video_id),
-        "hls_ready":      hls_builder.is_ready(video_id),
+        "job_states": transcode_queue.job_states(video_id),
     }

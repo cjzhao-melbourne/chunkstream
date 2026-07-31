@@ -34,6 +34,7 @@ class TranscodeJob:
     priority: int = 10
     state: JobState = JobState.PENDING
     retry: int = 0
+    profiles: list = field(default_factory=list)
 
 
 # Callback signature: (video_id, segment_index, rendition_results) -> None
@@ -44,7 +45,7 @@ class TranscodeQueue:
     MAX_CONCURRENT = 2
     MAX_RETRY      = 2
 
-    def __init__(self, transcoder, on_done: OnDoneCallback):
+    def __init__(self, transcoder, on_done: Optional[OnDoneCallback] = None):
         self._transcoder = transcoder
         self._on_done    = on_done
         self._jobs: dict[tuple, TranscodeJob] = {}
@@ -62,6 +63,7 @@ class TranscodeQueue:
         video_dir: str,
         seg_duration: Optional[float],
         priority: int = 10,
+        profiles: Optional[list] = None,
     ) -> bool:
         """
         Enqueue a segment for transcoding.
@@ -82,6 +84,7 @@ class TranscodeQueue:
                 video_id=video_id, index=index,
                 video_dir=video_dir, seg_duration=seg_duration,
                 priority=priority,
+                profiles=profiles or [],
             )
             self._jobs[key] = job
 
@@ -121,8 +124,8 @@ class TranscodeQueue:
     async def _run(self, job: TranscodeJob):
         key = (job.video_id, job.index)
         try:
-            init_path = os.path.join(job.video_dir, "init.m4s")
-            seg_path  = os.path.join(job.video_dir, f"segment_{job.index}.m4s")
+            init_path = os.path.join(job.video_dir, "dash", "source", "init.m4s")
+            seg_path  = os.path.join(job.video_dir, "dash", "source", f"segment_{job.index}.m4s")
 
             # Wait up to 120s for source segments to arrive (slow uploads)
             for _ in range(240):
@@ -136,12 +139,14 @@ class TranscodeQueue:
             results = await self._transcoder.transcode(
                 init_path, seg_path, output_dir,
                 job.index, job.seg_duration,
+                profiles=job.profiles or None,
             )
 
             async with self._lock:
                 job.state = JobState.DONE
 
-            await self._on_done(job.video_id, job.index, results)
+            if self._on_done:
+                await self._on_done(job.video_id, job.index, results)
             logger.info(f"Transcode done: {key}")
 
         except Exception as e:

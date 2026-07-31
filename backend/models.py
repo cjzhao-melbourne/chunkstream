@@ -6,9 +6,11 @@ from pydantic import BaseModel
 class InitUploadRequest(BaseModel):
     filename: str
     size: int
-    
     segment_count: Optional[int] = None
     segment_duration: Optional[float] = None
+    source_width: Optional[int] = None
+    source_height: Optional[int] = None
+    source_bitrate: Optional[int] = None
 
 
 class InitUploadResponse(BaseModel):

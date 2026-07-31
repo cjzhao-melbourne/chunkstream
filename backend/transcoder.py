@@ -19,6 +19,40 @@ PROFILES = [
     {"name": "360p",  "width": 640,  "height": 360,  "bitrate":   800_000},
 ]
 
+SOURCE_RENDITION = "source"
+
+
+def select_ladder(source_bitrate: int, source_height: int) -> list[dict]:
+    """Return profiles strictly lower quality than the source (no upscaling)."""
+    return [p for p in PROFILES if p["height"] < source_height and p["bitrate"] < source_bitrate]
+
+
+async def remux_source_to_ts(
+    init_path: str,
+    seg_path: str,
+    hls_dir: str,
+    segment_index: int,
+) -> str:
+    """Remux fMP4 → MPEG-TS without re-encoding for the source-quality HLS rung."""
+    source_dir = os.path.join(hls_dir, SOURCE_RENDITION)
+    os.makedirs(source_dir, exist_ok=True)
+    out_ts = os.path.join(source_dir, f"segment_{segment_index}.ts")
+    tmp_input = await _concat_to_temp(init_path, seg_path)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", tmp_input, "-c", "copy", "-f", "mpegts", out_ts,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"source remux failed: {stderr.decode()[-800:]}")
+        return out_ts
+    finally:
+        try:
+            os.remove(tmp_input)
+        except FileNotFoundError:
+            pass
+
 
 @dataclass
 class RenditionResult:
@@ -40,6 +74,7 @@ class Transcoder(ABC):
         output_dir: str,
         segment_index: int,
         segment_duration: Optional[float],
+        profiles: Optional[list] = None,
     ) -> list[RenditionResult]: ...
 
 
@@ -105,13 +140,15 @@ class FFmpegTranscoder(Transcoder):
         output_dir: str,
         segment_index: int,
         segment_duration: Optional[float],
+        profiles: Optional[list] = None,
     ) -> list[RenditionResult]:
+        _profiles = profiles if profiles is not None else PROFILES
         tmp_input = await _concat_to_temp(init_path, seg_path)
         output_paths: list[tuple[dict, str]] = []
 
         try:
             cmd = ["ffmpeg", "-y", "-i", tmp_input]
-            for p in PROFILES:
+            for p in _profiles:
                 rendition_dir = os.path.join(output_dir, p["name"])
                 os.makedirs(rendition_dir, exist_ok=True)
                 out = os.path.join(rendition_dir, f"segment_{segment_index}.ts")

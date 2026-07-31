@@ -21,6 +21,12 @@ On the backend, Chunkstream orchestrates uploads with a **two-queue scheduler** 
 
 The backend is written in **Python**, designed to be extended with **video transcoding , video analysis and intelligence** later (e.g., content tagging, scene detection, recommendations, etc.).
 
+## 30-Second Demo
+
+[![Watch the ChunkStream demo](https://img.youtube.com/vi/vGDgNL_T8lA/maxresdefault.jpg)](https://studio.youtube.com/video/vGDgNL_T8lA/edit)
+
+**Click the image to watch how ChunkStream makes a large video shareable and playable while it is still uploading.**
+
 ---
 
 ## 2. Key Features
@@ -122,7 +128,8 @@ chunkstream/
 
 ---
 
-## 6. how to run
+## 6. How to run
+
 
 cd backend
 source venv/bin/activate
